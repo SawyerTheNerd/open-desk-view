@@ -279,7 +279,7 @@ fn main() {
         eprintln!("[net] requesting H.264 (needs openh264-2.6.0-win64.dll next to the viewer).");
     }
 
-    let conn = match net::start(target, id, frame.clone(), wake) {
+    let conn = match net::start(target, id, use_h264, frame.clone(), wake) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("connection failed: {e}");

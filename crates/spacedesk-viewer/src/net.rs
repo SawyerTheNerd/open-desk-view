@@ -187,6 +187,7 @@ pub struct Connection {
 pub fn start(
     addr: SocketAddr,
     id: Identification,
+    allow_h264: bool,
     frame: SharedFrame,
     wake: Wake,
 ) -> io::Result<Connection> {
@@ -211,7 +212,7 @@ pub fn start(
     // Reader thread.
     let tx_reader = tx.clone();
     std::thread::spawn(move || {
-        if let Err(e) = read_loop(stream, tx_reader, frame, wake) {
+        if let Err(e) = read_loop(stream, tx_reader, allow_h264, frame, wake) {
             eprintln!("[net] receive loop ended: {e}");
         }
     });
@@ -228,6 +229,7 @@ fn read_exact_vec(stream: &mut TcpStream, len: usize) -> io::Result<Vec<u8>> {
 fn read_loop(
     mut stream: TcpStream,
     tx: Sender<Vec<u8>>,
+    allow_h264: bool,
     frame: SharedFrame,
     wake: Wake,
 ) -> io::Result<()> {
@@ -257,6 +259,11 @@ fn read_loop(
                 if fb.encoding == Encoding::Jpeg as u32 {
                     if let Err(e) = decode_jpeg_tile(&fb, &payload, &frame) {
                         eprintln!("[net] jpeg decode failed: {e}");
+                    }
+                } else if fb.encoding == Encoding::H264 as u32 && !allow_h264 {
+                    if !warned_encoding {
+                        eprintln!("[net] server sent H.264 but it was not requested (--h264); ignoring");
+                        warned_encoding = true;
                     }
                 } else if fb.encoding == Encoding::H264 as u32 {
                     if h264_dec.is_none() && !h264_tried {
@@ -308,12 +315,15 @@ fn read_loop(
     }
 }
 
-/// Locate Cisco's prebuilt OpenH264 library: `OPENH264_DLL` env, next to the exe, or CWD.
+/// Locate Cisco's prebuilt OpenH264 library. To avoid DLL-planting, we only accept an explicitly
+/// configured absolute path (`OPENH264_DLL`) or the file sitting next to our own executable — never
+/// the current working directory. The loaded blob's hash is additionally verified by
+/// `OpenH264API::from_blob_path` (it rejects anything that isn't a known Cisco build).
 fn find_openh264_lib() -> Option<std::path::PathBuf> {
     const NAME: &str = "openh264-2.6.0-win64.dll";
     if let Ok(p) = std::env::var("OPENH264_DLL") {
         let pb = std::path::PathBuf::from(p);
-        if pb.exists() {
+        if pb.is_absolute() && pb.exists() {
             return Some(pb);
         }
     }
@@ -324,10 +334,6 @@ fn find_openh264_lib() -> Option<std::path::PathBuf> {
                 return Some(p);
             }
         }
-    }
-    let p = std::path::PathBuf::from(NAME);
-    if p.exists() {
-        return Some(p);
     }
     None
 }
