@@ -1,0 +1,17 @@
+[package]
+name = "spacedesk-viewer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Open-source cross-platform spacedesk viewer (native, no OS webview)"
+
+[[bin]]
+name = "spacedesk-viewer"
+path = "src/main.rs"
+
+[dependencies]
+spacedesk-proto = { path = "../spacedesk-proto" }
+winit = "0.30"
+softbuffer = "0.4"
+jpeg-decoder = "0.3"

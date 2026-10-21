@@ -1,0 +1,15 @@
+/target
+**/*.rs.bk
+Cargo.lock
+.DS_Store
+# RE scratch / extracted binaries must never be committed
+/decomp/
+*.exe
+*.dll
+
+# Android build artifacts
+/android/.gradle/
+/android/build/
+/android/app/build/
+/android/local.properties
+*.apk
