@@ -234,6 +234,9 @@ fn read_loop(
     let mut hbuf = [0u8; HEADER_LEN];
     let mut frag_counter: u32 = 0;
     let mut warned_encoding = false;
+    let mut h264_dec: Option<openh264::decoder::Decoder> = None;
+    let mut h264_tried = false;
+    let mut h264_frames: u64 = 0;
 
     loop {
         stream.read_exact(&mut hbuf)?;
@@ -255,11 +258,27 @@ fn read_loop(
                     if let Err(e) = decode_jpeg_tile(&fb, &payload, &frame) {
                         eprintln!("[net] jpeg decode failed: {e}");
                     }
+                } else if fb.encoding == Encoding::H264 as u32 {
+                    if h264_dec.is_none() && !h264_tried {
+                        h264_tried = true;
+                        match create_h264_decoder() {
+                            Ok(d) => {
+                                eprintln!("[net] OpenH264 decoder loaded");
+                                h264_dec = Some(d);
+                            }
+                            Err(e) => eprintln!("[net] H.264 unavailable: {e}"),
+                        }
+                    }
+                    if let Some(d) = h264_dec.as_mut() {
+                        if decode_h264_frame(d, &payload, &frame) {
+                            h264_frames += 1;
+                            if h264_frames % 30 == 0 {
+                                eprintln!("[net] H.264 rendered {h264_frames} frames");
+                            }
+                        }
+                    }
                 } else if !warned_encoding {
-                    eprintln!(
-                        "[net] server sent encoding {} (only JPEG=3 implemented yet)",
-                        fb.encoding
-                    );
+                    eprintln!("[net] server sent unsupported encoding {}", fb.encoding);
                     warned_encoding = true;
                 }
 
@@ -286,6 +305,63 @@ fn read_loop(
             }
             _ => { /* Visibility / Rotation / Settings / cursor: ignored for now */ }
         }
+    }
+}
+
+/// Locate Cisco's prebuilt OpenH264 library: `OPENH264_DLL` env, next to the exe, or CWD.
+fn find_openh264_lib() -> Option<std::path::PathBuf> {
+    const NAME: &str = "openh264-2.6.0-win64.dll";
+    if let Ok(p) = std::env::var("OPENH264_DLL") {
+        let pb = std::path::PathBuf::from(p);
+        if pb.exists() {
+            return Some(pb);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let p = dir.join(NAME);
+            if p.exists() {
+                return Some(p);
+            }
+        }
+    }
+    let p = std::path::PathBuf::from(NAME);
+    if p.exists() {
+        return Some(p);
+    }
+    None
+}
+
+fn create_h264_decoder() -> Result<openh264::decoder::Decoder, String> {
+    let lib = find_openh264_lib().ok_or_else(|| {
+        "openh264-2.6.0-win64.dll not found — put it next to the viewer, set OPENH264_DLL, or \
+         download it from http://ciscobinary.openh264.org/openh264-2.6.0-win64.dll.bz2"
+            .to_string()
+    })?;
+    let api = openh264::OpenH264API::from_blob_path(&lib)
+        .map_err(|e| format!("loading {}: {e}", lib.display()))?;
+    openh264::decoder::Decoder::with_api_config(api, openh264::decoder::DecoderConfig::new())
+        .map_err(|e| format!("decoder init failed: {e}"))
+}
+
+/// Decode one full Annex-B access unit to RGB and composite it as a full frame.
+/// Returns true when a picture was produced.
+fn decode_h264_frame(dec: &mut openh264::decoder::Decoder, payload: &[u8], frame: &SharedFrame) -> bool {
+    match dec.decode(payload) {
+        Ok(Some(yuv)) => {
+            use openh264::formats::YUVSource;
+            let (w, h) = yuv.dimensions();
+            if w == 0 || h == 0 {
+                return false;
+            }
+            let mut rgb = vec![0u8; w * h * 3];
+            yuv.write_rgb8(&mut rgb);
+            let mut f = frame.lock().unwrap();
+            f.blit_rgb_tile(w as u32, h as u32, 0, 0, w as u32, h as u32, &rgb);
+            true
+        }
+        Ok(None) => false, // decoder needs more NAL units before the first picture
+        Err(_e) => false,  // corrupt/early frame: skip, keep going (openh264 recommends this)
     }
 }
 

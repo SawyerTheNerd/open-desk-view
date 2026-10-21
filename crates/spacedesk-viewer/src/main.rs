@@ -276,10 +276,7 @@ fn main() {
     });
 
     if use_h264 {
-        eprintln!("[note] desktop GUI H.264 decode isn't built in this release (OpenH264 needs a C/C++ toolchain).");
-        eprintln!("[note] Rendering the window with JPEG instead. The H.264 request itself works: try");
-        eprintln!("[note] `--probe --h264` to inspect the stream, or use the Android app for H.264 playback.");
-        id.encoding = Encoding::Jpeg;
+        eprintln!("[net] requesting H.264 (needs openh264-2.6.0-win64.dll next to the viewer).");
     }
 
     let conn = match net::start(target, id, frame.clone(), wake) {

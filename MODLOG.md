@@ -63,9 +63,12 @@ Server data is untrusted. Added bounds so a malicious/buggy server can't exhaust
 - **Android**: added hardware `MediaCodec` (video/avc) decoding **straight to the SurfaceView Surface** —
   no manual YUV→RGB, no Canvas. Toggle in the app (default on); JPEG remains as fallback. Built OK; not yet
   decode-tested on-device (Chromebook not adb-connected here; Fire TV off-limits by request).
-- **Desktop (Rust)**: OpenH264 needs a C/C++ toolchain (no cl/clang/nasm on this machine), so GUI H.264 is
-  deferred. `--h264` still exercises the request + probe; the GUI falls back to JPEG with a note.
-- App bumped to 0.2.0 (versionCode 2).
+- **Desktop (Rust)**: no C/C++ toolchain here, so instead of the openh264 `source` feature we use the
+  `libloading` feature + Cisco's **prebuilt** `openh264-2.6.0-win64.dll` (sha256 2076cb…b24691, loaded via
+  `OpenH264API::from_blob_path` → `Decoder::with_api_config`). `--h264` on the GUI now decodes to RGB and
+  renders. Verified live: `OpenH264 decoder loaded` → `H.264 rendered 30 frames` against 127.0.0.1. The DLL
+  must sit next to the exe (or `OPENH264_DLL`); it's a release asset, not committed (Cisco's own binary).
+- App bumped to 0.2.0 (versionCode 2); desktop H.264 shipped in repo release v0.3.0.
 
 ### Open questions
 - Exact extended-identification flag byte (off38) vs the observed off36=0x10003 in one source — confirm by
