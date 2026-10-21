@@ -199,7 +199,9 @@ fn main() {
 
     // Headless protocol probe: `spacedesk-viewer --probe <ip>`
     let probe_mode = args.iter().any(|a| a == "--probe");
-    args.retain(|a| a != "--probe");
+    // Opt-in convenience: connect to the first discovered server without an explicit IP.
+    let connect_first = args.iter().any(|a| a == "--connect-first");
+    args.retain(|a| a != "--probe" && a != "--connect-first");
 
     let target: SocketAddr = if let Some(first) = args.first() {
         match parse_target(first) {
@@ -213,10 +215,22 @@ fn main() {
         eprintln!("[discovery] broadcasting on UDP {} ...", proto::DEFAULT_PORT);
         match net::discover(Duration::from_millis(1200)) {
             Ok(list) if !list.is_empty() => {
-                for d in &list {
-                    eprintln!("  found: {}  ({})", d.addr.ip(), d.name);
+                eprintln!("discovered {} server(s):", list.len());
+                for (i, d) in list.iter().enumerate() {
+                    eprintln!("  [{i}] {}  ({})", d.addr.ip(), d.name);
                 }
-                list[0].addr
+                if connect_first {
+                    eprintln!("[discovery] --connect-first: using [0] {}", list[0].addr.ip());
+                    list[0].addr
+                } else {
+                    // Do NOT auto-connect: the stream is unencrypted, so a rogue host that answers
+                    // discovery could receive your keystrokes. Require an explicit, trusted choice.
+                    eprintln!();
+                    eprintln!("Not auto-connecting: the connection is UNENCRYPTED, so only connect to a server");
+                    eprintln!("you trust. Re-run with its IP, e.g.:");
+                    eprintln!("    spacedesk-viewer {}", list[0].addr.ip());
+                    return;
+                }
             }
             Ok(_) => {
                 eprintln!("no spacedesk servers found. Pass the server IP, e.g. `spacedesk-viewer 192.168.1.103`");
@@ -230,6 +244,7 @@ fn main() {
     };
 
     eprintln!("[net] connecting to {target} ...");
+    eprintln!("[warning] the spacedesk stream is UNENCRYPTED — screen and input travel in clear text on the LAN.");
 
     if probe_mode {
         match net::probe(target, Identification::default(), 5) {

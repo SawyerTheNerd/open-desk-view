@@ -117,6 +117,9 @@ class SpacedeskClient(
                 val h = ByteBuffer.wrap(hbuf).order(ByteOrder.LITTLE_ENDIAN)
                 val type = h.getInt(0)
                 val plen = h.getInt(4)
+                if (plen < 0 || plen > MAX_PAYLOAD) {
+                    throw IllegalStateException("server declared payload $plen (cap $MAX_PAYLOAD)")
+                }
                 val payload = if (plen > 0) ByteArray(plen).also { input.readFully(it) } else EMPTY
 
                 when (type) {
@@ -146,7 +149,7 @@ class SpacedeskClient(
 
     private fun handleFramebuffer(h: ByteBuffer, payload: ByteArray) {
         val fb = Protocol.Framebuffer(h)
-        if (fb.width <= 0 || fb.height <= 0) return
+        if (fb.width <= 0 || fb.height <= 0 || fb.width > MAX_DIM || fb.height > MAX_DIM) return
 
         if (full == null || serverW != fb.width || serverH != fb.height) {
             synchronized(frameLock) {
@@ -203,7 +206,9 @@ class SpacedeskClient(
     }
 
     companion object {
-        private const val TAG = "spacedesk"
+        private const val TAG = "opendeskview"
+        private const val MAX_PAYLOAD = 64 * 1024 * 1024
+        private const val MAX_DIM = 16384
         private val EMPTY = ByteArray(0)
     }
 }

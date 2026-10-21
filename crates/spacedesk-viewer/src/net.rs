@@ -14,6 +14,13 @@ use crate::frame::SharedFrame;
 /// Called by the receive loop whenever a new frame is ready, so the UI can repaint.
 pub type Wake = Arc<dyn Fn() + Send + Sync>;
 
+/// Hard cap on any single message payload from the (untrusted) server. A 4K JPEG band is a few MB;
+/// 64 MB is far more than legitimate traffic needs and bounds memory against a malicious length.
+pub const MAX_PAYLOAD: usize = 64 * 1024 * 1024;
+
+/// Upper bound passed to the JPEG decoder for its working buffer.
+const MAX_JPEG_BUFFER: usize = 128 * 1024 * 1024;
+
 /// A discovered server on the LAN.
 #[derive(Debug, Clone)]
 pub struct Discovered {
@@ -104,6 +111,12 @@ pub fn probe(addr: SocketAddr, id: Identification, secs: u64) -> io::Result<()> 
         let header = Header::from_bytes(&hbuf).unwrap();
         let ty = header.get_u32(0);
         let plen = header.payload_len();
+        if plen > MAX_PAYLOAD {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("server declared payload {plen} > cap {MAX_PAYLOAD}"),
+            ));
+        }
         *counts.entry(ty).or_insert(0) += 1;
 
         let payload = if plen > 0 {
@@ -228,6 +241,12 @@ fn read_loop(
         stream.read_exact(&mut hbuf)?;
         let header = Header::from_bytes(&hbuf).expect("128 bytes");
         let plen = header.payload_len();
+        if plen > MAX_PAYLOAD {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("server declared payload {plen} > cap {MAX_PAYLOAD}"),
+            ));
+        }
         let payload = if plen > 0 { read_exact_vec(&mut stream, plen)? } else { Vec::new() };
 
         match header.msg_type() {
@@ -275,6 +294,7 @@ fn read_loop(
 fn decode_jpeg_tile(fb: &Framebuffer, payload: &[u8], frame: &SharedFrame) -> io::Result<()> {
     use jpeg_decoder::{Decoder, PixelFormat};
     let mut dec = Decoder::new(std::io::Cursor::new(payload));
+    dec.set_max_decoding_buffer_size(MAX_JPEG_BUFFER);
     let pixels = dec
         .decode()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;

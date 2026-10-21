@@ -3,6 +3,15 @@
 
 use std::sync::Mutex;
 
+/// Maximum accepted width/height from the (untrusted) server, per axis.
+pub const MAX_DIM: u32 = 16384;
+
+/// Validate server-supplied dimensions and that `w*h` fits without overflow.
+fn dims_ok(w: u32, h: u32) -> bool {
+    w > 0 && h > 0 && w <= MAX_DIM && h <= MAX_DIM
+        && (w as usize).checked_mul(h as usize).is_some()
+}
+
 pub struct Frame {
     pub width: u32,
     pub height: u32,
@@ -16,12 +25,18 @@ impl Frame {
         Frame { width: 0, height: 0, pixels: Vec::new(), generation: 0 }
     }
 
-    fn ensure_size(&mut self, w: u32, h: u32) {
+    /// Resize the backing buffer. Returns false (and leaves the frame unchanged) for
+    /// out-of-range or overflowing dimensions.
+    fn ensure_size(&mut self, w: u32, h: u32) -> bool {
+        if !dims_ok(w, h) {
+            return false;
+        }
         if self.width != w || self.height != h {
             self.width = w;
             self.height = h;
             self.pixels = vec![0u32; (w as usize) * (h as usize)];
         }
+        true
     }
 
     /// Composite a decoded RGB(8) tile into the full framebuffer at the given rectangle.
@@ -36,8 +51,7 @@ impl Frame {
         rect_h: u32,
         rgb: &[u8],
     ) {
-        self.ensure_size(full_w, full_h);
-        if full_w == 0 || full_h == 0 {
+        if !self.ensure_size(full_w, full_h) {
             return;
         }
         for row in 0..rect_h {

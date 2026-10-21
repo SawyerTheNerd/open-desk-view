@@ -44,6 +44,16 @@ Reverse-engineering log for the open-source spacedesk viewer. Append confirmed f
 - Fire TV has no touchscreen, so **touch is not yet verified live** — that happens on the Chromebook.
 - APK: `android/app/build/outputs/apk/debug/app-debug.apk` (~810 KB).
 
+## 2026-10-21 — input-hardening pass
+
+Server data is untrusted. Added bounds so a malicious/buggy server can't exhaust memory or redirect input:
+- `net.rs`: reject any message payload > 64 MB; cap the JPEG decoder working buffer (128 MB).
+- `frame.rs`: reject server dimensions outside 1..=16384 per axis; checked `w*h`.
+- Kotlin `SpacedeskClient`: reject payloadLen < 0 or > 64 MB; bound bitmap width/height ≤ 16384.
+- `main.rs`: discovery no longer auto-connects (a rogue LAN host answering discovery could receive
+  keystrokes over the unencrypted link); it lists servers and requires an explicit IP, or `--connect-first`
+  to opt in. Every connect prints an "unencrypted" warning.
+
 ### Open questions
 - Exact extended-identification flag byte (off38) vs the observed off36=0x10003 in one source — confirm by
   live capture against this server.

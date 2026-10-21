@@ -36,7 +36,7 @@ cargo build --release
 Run it (the machine running the spacedesk **Server** must be reachable):
 
 ```bash
-# auto-discover servers on the LAN and connect to the first one
+# discover servers on the LAN and list them (does NOT auto-connect — the stream is unencrypted)
 ./target/release/spacedesk-viewer
 
 # or connect to a known server
