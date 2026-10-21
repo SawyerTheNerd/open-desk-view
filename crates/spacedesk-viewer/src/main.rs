@@ -24,7 +24,7 @@ use winit::keyboard::PhysicalKey;
 use winit::window::{Window, WindowId};
 
 use frame::{Frame, SharedFrame};
-use spacedesk_proto::{self as proto, Identification};
+use spacedesk_proto::{self as proto, Encoding, Identification};
 
 #[derive(Debug, Clone, Copy)]
 enum UserEvent {
@@ -201,7 +201,14 @@ fn main() {
     let probe_mode = args.iter().any(|a| a == "--probe");
     // Opt-in convenience: connect to the first discovered server without an explicit IP.
     let connect_first = args.iter().any(|a| a == "--connect-first");
-    args.retain(|a| a != "--probe" && a != "--connect-first");
+    // Request H.264 (encoding 4) instead of the default JPEG.
+    let use_h264 = args.iter().any(|a| a == "--h264");
+    args.retain(|a| a != "--probe" && a != "--connect-first" && a != "--h264");
+
+    let mut id = Identification::default();
+    if use_h264 {
+        id.encoding = Encoding::H264;
+    }
 
     let target: SocketAddr = if let Some(first) = args.first() {
         match parse_target(first) {
@@ -247,7 +254,7 @@ fn main() {
     eprintln!("[warning] the spacedesk stream is UNENCRYPTED — screen and input travel in clear text on the LAN.");
 
     if probe_mode {
-        match net::probe(target, Identification::default(), 5) {
+        match net::probe(target, id.clone(), 5) {
             Ok(()) => return,
             Err(e) => {
                 eprintln!("probe failed: {e}");
@@ -268,7 +275,13 @@ fn main() {
         let _ = proxy.send_event(UserEvent::FrameReady);
     });
 
-    let id = Identification::default();
+    if use_h264 {
+        eprintln!("[note] desktop GUI H.264 decode isn't built in this release (OpenH264 needs a C/C++ toolchain).");
+        eprintln!("[note] Rendering the window with JPEG instead. The H.264 request itself works: try");
+        eprintln!("[note] `--probe --h264` to inspect the stream, or use the Android app for H.264 playback.");
+        id.encoding = Encoding::Jpeg;
+    }
+
     let conn = match net::start(target, id, frame.clone(), wake) {
         Ok(c) => c,
         Err(e) => {

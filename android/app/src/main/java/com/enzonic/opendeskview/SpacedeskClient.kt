@@ -6,7 +6,10 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Rect
+import android.media.MediaCodec
+import android.media.MediaFormat
 import android.util.Log
+import android.view.Surface
 import android.view.SurfaceHolder
 import java.io.BufferedInputStream
 import java.io.DataInputStream
@@ -18,8 +21,10 @@ import java.nio.ByteOrder
 
 /**
  * One spacedesk display session. Runs its own network thread: connects, identifies (extended
- * display at the requested resolution), decodes JPEG framebuffer bands, composites them, and
- * paints directly to the given [SurfaceHolder]. Input is sent back through [sendTouch].
+ * display at the requested resolution), then either
+ *  - decodes JPEG framebuffer bands with BitmapFactory and paints them to the [SurfaceHolder], or
+ *  - feeds H.264 Annex-B access units to a hardware MediaCodec that renders straight to the Surface.
+ * Input is sent back through [sendTouch].
  */
 class SpacedeskClient(
     private val host: String,
@@ -27,6 +32,7 @@ class SpacedeskClient(
     private val reqWidth: Int,
     private val reqHeight: Int,
     private val deviceName: String,
+    private val encoding: Int,
     private val listener: Listener,
 ) {
     interface Listener {
@@ -36,29 +42,39 @@ class SpacedeskClient(
 
     @Volatile private var running = false
     @Volatile private var holder: SurfaceHolder? = null
+    @Volatile private var surface: Surface? = null
     private var socket: Socket? = null
     private var out: OutputStream? = null
 
+    // JPEG path
     private var full: Bitmap? = null
     private val frameLock = Any()
+    private val paint = Paint().apply { isFilterBitmap = true }
+    private val clearPaint = Paint().apply { color = Color.rgb(16, 16, 20) }
+
+    // H.264 path
+    private var codec: MediaCodec? = null
+    private var ptsUs = 0L
+
     private var serverW = 0
     private var serverH = 0
     private var fragCounter = 0
     private var frameCount = 0
 
-    private val paint = Paint().apply { isFilterBitmap = true }
-    private val clearPaint = Paint().apply { color = Color.rgb(16, 16, 20) }
+    private val isH264 get() = encoding == Protocol.ENC_H264
 
     fun setSurface(h: SurfaceHolder?) {
         holder = h
-        if (h != null) repaint()
+        surface = h?.surface
+        if (h == null && isH264) releaseCodec()
+        if (h != null && !isH264) repaint()
     }
 
     fun serverSize(): Pair<Int, Int> = serverW to serverH
 
     fun start() {
         running = true
-        Thread({ runLoop() }, "spacedesk-net").start()
+        Thread({ runLoop() }, "opendeskview-net").start()
     }
 
     fun stop() {
@@ -71,6 +87,7 @@ class SpacedeskClient(
             socket?.close()
         } catch (_: Exception) {
         }
+        releaseCodec()
     }
 
     private fun send(bytes: ByteArray) {
@@ -84,7 +101,6 @@ class SpacedeskClient(
         }
     }
 
-    /** Send an absolute touch event in server-pixel coordinates. */
     fun sendTouch(xServer: Int, yServer: Int, flags: Int, ts: Int) {
         if (serverW == 0) return
         send(Protocol.buildTouch(xServer, yServer, serverW, serverH, flags, ts))
@@ -105,7 +121,7 @@ class SpacedeskClient(
                     height = reqHeight,
                     quality = 80,
                     fps = 60,
-                    encoding = Protocol.ENC_JPEG,
+                    encoding = encoding,
                     guid = "{00000000-0000-0000-0000-000000000001}",
                     deviceName = deviceName,
                 )
@@ -129,7 +145,7 @@ class SpacedeskClient(
                         running = false
                         listener.onDisconnected("server closed the session")
                     }
-                    else -> { /* visibility / rotation / settings / cursor: ignored for now */ }
+                    else -> { /* visibility / rotation / settings / cursor: ignored */ }
                 }
             }
             listener.onDisconnected("stopped")
@@ -144,6 +160,7 @@ class SpacedeskClient(
                 socket?.close()
             } catch (_: Exception) {
             }
+            releaseCodec()
         }
     }
 
@@ -151,17 +168,23 @@ class SpacedeskClient(
         val fb = Protocol.Framebuffer(h)
         if (fb.width <= 0 || fb.height <= 0 || fb.width > MAX_DIM || fb.height > MAX_DIM) return
 
-        if (full == null || serverW != fb.width || serverH != fb.height) {
-            synchronized(frameLock) {
-                full = Bitmap.createBitmap(fb.width, fb.height, Bitmap.Config.ARGB_8888)
-            }
+        val isNew = serverW != fb.width || serverH != fb.height
+        if (isNew) {
             serverW = fb.width
             serverH = fb.height
             Log.i(TAG, "connected: server ${serverW}x$serverH enc=${fb.encoding}")
             listener.onConnected(serverW, serverH)
         }
 
-        if (fb.encoding == Protocol.ENC_JPEG && payload.isNotEmpty()) {
+        var committed = false
+        if (fb.encoding == Protocol.ENC_H264) {
+            committed = decodeH264(payload)
+        } else if (fb.encoding == Protocol.ENC_JPEG && payload.isNotEmpty()) {
+            if (full == null || isNew) {
+                synchronized(frameLock) {
+                    full = Bitmap.createBitmap(serverW, serverH, Bitmap.Config.ARGB_8888)
+                }
+            }
             val tile = BitmapFactory.decodeByteArray(payload, 0, payload.size)
             if (tile != null) {
                 synchronized(frameLock) {
@@ -172,13 +195,91 @@ class SpacedeskClient(
         }
 
         fragCounter++
-        if (fb.fragmentInfo == 0 || fragCounter % 4 == 0) {
+        if (fb.encoding == Protocol.ENC_H264) {
+            // One full access unit per message: ack every frame.
+            if (committed) {
+                send(Protocol.buildFlowAck())
+                countFrame()
+            }
+        } else if (fb.fragmentInfo == 0 || fragCounter % 4 == 0) {
             send(Protocol.buildFlowAck())
             repaint()
-            frameCount++
-            if (frameCount % 30 == 0) Log.i(TAG, "rendered $frameCount frames")
+            countFrame()
         }
     }
+
+    private fun countFrame() {
+        frameCount++
+        if (frameCount % 30 == 0) Log.i(TAG, "rendered $frameCount frames")
+    }
+
+    // --- H.264 (MediaCodec, hardware, renders straight to the Surface) ---
+
+    private fun ensureCodec(): Boolean {
+        if (codec != null) return true
+        val surf = surface ?: return false
+        return try {
+            val fmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, serverW, serverH)
+            val c = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+            c.configure(fmt, surf, null, 0)
+            c.start()
+            codec = c
+            ptsUs = 0
+            Log.i(TAG, "MediaCodec AVC started ${serverW}x$serverH")
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "MediaCodec init failed", e)
+            listener.onDisconnected("H.264 decoder unavailable: ${e.message}")
+            running = false
+            false
+        }
+    }
+
+    /** Feed one Annex-B access unit; render any ready output frames. Returns true if a frame rendered. */
+    private fun decodeH264(au: ByteArray): Boolean {
+        if (au.isEmpty()) return false
+        if (!ensureCodec()) return false
+        val c = codec ?: return false
+        try {
+            val inIdx = c.dequeueInputBuffer(10_000)
+            if (inIdx >= 0) {
+                val buf = c.getInputBuffer(inIdx)
+                if (buf != null) {
+                    buf.clear()
+                    buf.put(au)
+                    c.queueInputBuffer(inIdx, 0, au.size, ptsUs, 0)
+                    ptsUs += 16_666
+                }
+            }
+            var rendered = false
+            val info = MediaCodec.BufferInfo()
+            var outIdx = c.dequeueOutputBuffer(info, 0)
+            while (outIdx >= 0) {
+                c.releaseOutputBuffer(outIdx, true) // render to the Surface
+                rendered = true
+                outIdx = c.dequeueOutputBuffer(info, 0)
+            }
+            return rendered
+        } catch (e: Exception) {
+            Log.e(TAG, "H.264 decode error", e)
+            return false
+        }
+    }
+
+    private fun releaseCodec() {
+        val c = codec ?: return
+        codec = null
+        try {
+            c.stop()
+        } catch (_: Exception) {
+        }
+        try {
+            c.release()
+        } catch (_: Exception) {
+        }
+    }
+
+    // --- JPEG (Canvas blit) ---
 
     private fun repaint() {
         val hdr = holder ?: return
@@ -193,8 +294,7 @@ class SpacedeskClient(
                 if (bmp == null) {
                     canvas.drawRect(0f, 0f, canvas.width.toFloat(), canvas.height.toFloat(), clearPaint)
                 } else {
-                    val dst = Rect(0, 0, canvas.width, canvas.height)
-                    canvas.drawBitmap(bmp, null, dst, paint)
+                    canvas.drawBitmap(bmp, null, Rect(0, 0, canvas.width, canvas.height), paint)
                 }
             }
         } finally {

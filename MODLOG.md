@@ -54,6 +54,19 @@ Server data is untrusted. Added bounds so a malicious/buggy server can't exhaust
   keystrokes over the unencrypted link); it lists servers and requires an explicit IP, or `--connect-first`
   to opt in. Every connect prints an "unencrypted" warning.
 
+## 2026-10-21 — H.264 (encoding 4)
+
+- Confirmed via `--probe --h264`: when the client identifies with encoding=4, the server streams H.264.
+  Each type-2 message carries a **full Annex-B access unit** (rect = whole screen, `fragmentInfo=0`, one
+  frame per message — no banding). First payload: `00 00 00 01 09 10 | 00 00 00 01 67 4D 40 2A …` = AUD +
+  SPS (Main, level 4.2) + …. ~20 fps full frames, far less bandwidth than JPEG's 4 bands.
+- **Android**: added hardware `MediaCodec` (video/avc) decoding **straight to the SurfaceView Surface** —
+  no manual YUV→RGB, no Canvas. Toggle in the app (default on); JPEG remains as fallback. Built OK; not yet
+  decode-tested on-device (Chromebook not adb-connected here; Fire TV off-limits by request).
+- **Desktop (Rust)**: OpenH264 needs a C/C++ toolchain (no cl/clang/nasm on this machine), so GUI H.264 is
+  deferred. `--h264` still exercises the request + probe; the GUI falls back to JPEG with a note.
+- App bumped to 0.2.0 (versionCode 2).
+
 ### Open questions
 - Exact extended-identification flag byte (off38) vs the observed off36=0x10003 in one source — confirm by
   live capture against this server.

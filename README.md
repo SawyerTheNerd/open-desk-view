@@ -82,6 +82,9 @@ gradle assembleDebug          # -> app/build/outputs/apk/debug/app-debug.apk
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
+It defaults to **H.264** (hardware `MediaCodec`, decoded straight to the display Surface — low bandwidth);
+untick the box on the start screen to fall back to JPEG if a device's decoder misbehaves.
+
 On the Chromebook: enable **Linux/ADB debugging** (Settings → "Develop Android apps") or sideload the APK,
 open **OpenDeskView**, enter the PC's IP (or tap *Discover on LAN*), and Connect. The spacedesk Server
 must be running on the PC. Status: display + flow control + ping verified live at ~30 fps on a real device;
@@ -89,8 +92,9 @@ touch plumbing is in place and gets its first live test on a touchscreen.
 
 ## Roadmap
 
-- [x] Milestone 1: JPEG display + input (this release)
-- [ ] H.264 (encoding 4) decode via openh264/FFmpeg for low-bandwidth, high-res streams
+- [x] Milestone 1: JPEG display + input
+- [x] H.264 (encoding 4) on Android via hardware `MediaCodec` (toggle in the app; default on)
+- [ ] H.264 on desktop (Rust) via OpenH264/FFmpeg — needs a C/C++ toolchain to build the decoder
 - [ ] Verify + finalize input field semantics against the live server
 - [ ] Audio (type 14 speaker session)
 - [ ] Mobile (Android/iOS) front-ends over the same `spacedesk-proto` core

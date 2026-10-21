@@ -147,18 +147,16 @@ pub fn probe(addr: SocketAddr, id: Identification, secs: u64) -> io::Result<()> 
                     fb.rect_left, fb.rect_top, fb.rect_right, fb.rect_bottom,
                     fb.encoding, fb.fragment_info, fb.payload_len
                 );
-                // Is the payload a JPEG? (FF D8 ... FF D9)
-                if payload.len() >= 2 {
-                    eprintln!(
-                        "[probe] payload starts {:02X} {:02X} ({})",
-                        payload[0], payload[1],
-                        if payload.first() == Some(&0xFF) && payload.get(1) == Some(&0xD8) {
-                            "JPEG SOI"
-                        } else {
-                            "not JPEG SOI"
-                        }
-                    );
-                }
+                let n = payload.len().min(16);
+                let head: Vec<String> = payload[..n].iter().map(|b| format!("{b:02X}")).collect();
+                let kind = if payload.first() == Some(&0xFF) && payload.get(1) == Some(&0xD8) {
+                    "JPEG SOI"
+                } else if payload.starts_with(&[0, 0, 0, 1]) || payload.starts_with(&[0, 0, 1]) {
+                    "H.264 Annex-B start code"
+                } else {
+                    "unknown"
+                };
+                eprintln!("[probe] payload[0..{n}] = {}  ({kind})", head.join(" "));
                 first_fb_logged = true;
                 // keep the stream flowing
                 wstream.write_all(&proto::build_flow_ack()).ok();

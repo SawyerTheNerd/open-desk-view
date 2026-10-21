@@ -40,7 +40,15 @@ class ViewerActivity : Activity(), SurfaceHolder.Callback, SpacedeskClient.Liste
         val reqW = m.widthPixels.coerceAtLeast(640)
         val reqH = m.heightPixels.coerceAtLeast(480)
 
-        client = SpacedeskClient(host, port, reqW, reqH, android.os.Build.MODEL ?: "android", this)
+        val encoding = if (intent.getBooleanExtra(EXTRA_H264, true)) {
+            Protocol.ENC_H264
+        } else {
+            Protocol.ENC_JPEG
+        }
+
+        client = SpacedeskClient(
+            host, port, reqW, reqH, android.os.Build.MODEL ?: "android", encoding, this
+        )
     }
 
     private fun onTouch(ev: MotionEvent) {
@@ -114,5 +122,6 @@ class ViewerActivity : Activity(), SurfaceHolder.Callback, SpacedeskClient.Liste
     companion object {
         const val EXTRA_HOST = "host"
         const val EXTRA_PORT = "port"
+        const val EXTRA_H264 = "h264"
     }
 }

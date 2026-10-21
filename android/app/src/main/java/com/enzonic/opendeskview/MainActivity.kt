@@ -7,6 +7,7 @@ import android.text.InputType
 import android.view.Gravity
 import android.view.ViewGroup
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -17,6 +18,7 @@ class MainActivity : Activity() {
 
     private lateinit var ipField: EditText
     private lateinit var status: TextView
+    private lateinit var h264Box: CheckBox
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -43,6 +45,11 @@ class MainActivity : Activity() {
             )
         }
 
+        h264Box = CheckBox(this).apply {
+            text = "Use H.264 (hardware decode — lower bandwidth)"
+            isChecked = true
+        }
+
         val connectBtn = Button(this).apply {
             text = "Connect"
             setOnClickListener { connect() }
@@ -60,6 +67,7 @@ class MainActivity : Activity() {
 
         root.addView(title)
         root.addView(ipField)
+        root.addView(h264Box)
         root.addView(connectBtn)
         root.addView(discoverBtn)
         root.addView(status)
@@ -76,6 +84,7 @@ class MainActivity : Activity() {
             Intent(this, ViewerActivity::class.java)
                 .putExtra(ViewerActivity.EXTRA_HOST, host)
                 .putExtra(ViewerActivity.EXTRA_PORT, Protocol.DEFAULT_PORT)
+                .putExtra(ViewerActivity.EXTRA_H264, h264Box.isChecked)
         )
     }
 
