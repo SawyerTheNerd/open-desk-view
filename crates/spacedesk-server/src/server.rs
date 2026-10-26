@@ -68,16 +68,22 @@ fn handle_client(
     let peer = stream.peer_addr().ok();
     println!("[server] client connected: {peer:?} (input {})", if allow_input { "ENABLED" } else { "off" });
 
-    // Resolve the requested monitor at connect time (so a virtual display added after
-    // startup is picked up). Falls back to the primary if the index is out of range.
-    let target: Option<capture::Display> = display.and_then(|i| {
-        let list = capture::list_displays();
-        let found = list.into_iter().find(|d| d.index == i);
-        if found.is_none() {
-            eprintln!("[server] display index {i} not found; using primary");
-        }
-        found
-    });
+    // Resolve the requested monitor to its STABLE device name at connect time. We identify
+    // by name (not enumeration index) from here on, and — crucially — if a specific display
+    // was requested we NEVER fall back to the primary: doing so would leak the main screen to
+    // the viewer. If the requested display isn't present, refuse the connection.
+    let target_name: Option<String> = match display {
+        None => None, // no --display: stream the primary
+        Some(i) => match capture::list_displays().into_iter().find(|d| d.index == i) {
+            Some(d) => Some(d.name),
+            None => {
+                eprintln!(
+                    "[server] display index {i} not found; refusing (will NOT fall back to primary)"
+                );
+                return Ok(());
+            }
+        },
+    };
     stream.set_nodelay(true).ok();
     let mut reader = stream.try_clone()?;
     let mut writer = stream;
@@ -139,12 +145,23 @@ fn handle_client(
             }
         }
 
-        let frame = match target.as_ref().and_then(capture::capture_display).or_else(capture::capture_primary) {
-            Some(f) => f,
-            None => {
-                std::thread::sleep(Duration::from_millis(50));
-                continue;
-            }
+        // Re-resolve the target by name each frame. If a requested display has gone away,
+        // skip the frame and wait for it to return — never substitute the primary.
+        let frame = match &target_name {
+            Some(name) => match capture::find_display_by_name(name).and_then(|d| capture::capture_display(&d)) {
+                Some(f) => f,
+                None => {
+                    std::thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+            },
+            None => match capture::capture_primary() {
+                Some(f) => f,
+                None => {
+                    std::thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
+            },
         };
         let rgb = capture::bgra_to_rgb(&frame.bgra, frame.w, frame.h);
         let mut jpeg = Vec::new();

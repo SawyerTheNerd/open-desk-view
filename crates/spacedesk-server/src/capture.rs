@@ -123,6 +123,12 @@ pub fn capture_display(d: &Display) -> Option<Frame> {
     capture_rect(d.left, d.top, d.width, d.height)
 }
 
+/// Find a monitor by its stable device name (e.g. "\\.\DISPLAY2"). Identity is re-checked
+/// this way each frame so a requested display is never silently confused with another.
+pub fn find_display_by_name(name: &str) -> Option<Display> {
+    list_displays().into_iter().find(|d| d.name == name)
+}
+
 /// Capture the primary display. Returns None on failure.
 pub fn capture_primary() -> Option<Frame> {
     unsafe {
