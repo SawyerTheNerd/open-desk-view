@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{IpAddr, TcpListener, TcpStream, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener, TcpStream, UdpSocket};
 use std::sync::mpsc::channel;
 use std::time::{Duration, Instant};
 
@@ -237,6 +237,12 @@ fn discovery_responder(bind: &str) -> std::io::Result<()> {
         if !buf[..n].starts_with(b"SPACEDESK-NET-CLIENT") {
             continue;
         }
+        // This is a LAN discovery beacon: only local-network sources can be legitimate
+        // clients. Ignoring everything else removes the internet reflection vector and
+        // keeps a remote flood from draining the shared global budget below.
+        if !is_lan_source(&from.ip()) {
+            continue;
+        }
         let now = Instant::now();
 
         // Prune stale entries on a timer, not on every packet.
@@ -270,6 +276,37 @@ fn discovery_responder(bind: &str) -> std::io::Result<()> {
         let reply = build_discovery_reply();
         let _ = sock.send_to(&reply, from);
     }
+}
+
+/// True for source addresses that could be a client on the local network:
+/// loopback, RFC1918 private, link-local, CGNAT, plus IPv6 loopback / link-local (fe80::/10)
+/// / unique-local (fc00::/7). Everything else (public internet) is ignored.
+fn is_lan_source(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || is_cgnat(v4)
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback() || is_v6_link_local(v6) || is_v6_unique_local(v6)
+        }
+    }
+}
+
+// 100.64.0.0/10 (RFC 6598 carrier-grade NAT), as used by e.g. Tailscale.
+fn is_cgnat(v4: &Ipv4Addr) -> bool {
+    let o = v4.octets();
+    o[0] == 100 && (o[1] & 0xc0) == 64
+}
+
+fn is_v6_link_local(v6: &Ipv6Addr) -> bool {
+    (v6.segments()[0] & 0xffc0) == 0xfe80
+}
+
+fn is_v6_unique_local(v6: &Ipv6Addr) -> bool {
+    (v6.segments()[0] & 0xfe00) == 0xfc00
 }
 
 fn build_discovery_reply() -> Vec<u8> {
