@@ -21,6 +21,7 @@ is wrapped in a system WebView.
 crates/
   spacedesk-proto/   # transport-agnostic wire protocol (header, messages, discovery) + tests
   spacedesk-viewer/  # the app: TCP client, JPEG decode, winit/softbuffer window, input
+  spacedesk-server/  # open-source server (Windows): capture, stream, inject input — replaces spacedesk
 docs/PROTOCOL.md     # the reverse-engineered wire protocol (v4.8), written from scratch
 MODLOG.md            # reverse-engineering journal
 ```
@@ -92,15 +93,46 @@ It defaults to **H.264** (hardware `MediaCodec`, decoded straight to the display
 untick the box on the start screen to fall back to JPEG if a device's decoder misbehaves.
 
 On the Chromebook: enable **Linux/ADB debugging** (Settings → "Develop Android apps") or sideload the APK,
-open **OpenDeskView**, enter the PC's IP (or tap *Discover on LAN*), and Connect. The spacedesk Server
-must be running on the PC. Status: display + flow control + ping verified live at ~30 fps on a real device;
+open **OpenDeskView**, enter the PC's IP (or tap *Discover on LAN*), and Connect. A server must be
+running on the PC — OpenDeskView's own (below) or spacedesk's. Status: display + flow control + ping verified live at ~30 fps on a real device;
 touch plumbing is in place and gets its first live test on a touchscreen.
+
+## Server (Windows) — no spacedesk needed
+
+`spacedesk-server` speaks the same protocol, so the viewers above connect to it unchanged and spacedesk
+can be uninstalled. For a **true extended display** (a real second monitor, not a mirror) it streams a
+virtual monitor created by the open-source, code-signed
+[Virtual Display Driver](https://github.com/VirtualDrivers/Virtual-Display-Driver) (MIT, IddCx).
+
+One-time driver install (admin; no test-signing or reboot needed). Download `VDD.Control.<version>.zip`
+from that project's releases, extract it, and from an elevated PowerShell in the extracted folder:
+
+```powershell
+New-Item -ItemType Directory -Force C:\VirtualDisplayDriver | Out-Null
+Copy-Item .\SignedDrivers\x86\VDD\* C:\VirtualDisplayDriver   # "x86" folder holds the x64 build
+pnputil /add-driver C:\VirtualDisplayDriver\MttVDD.inf /install
+.\Dependencies\devcon.exe install C:\VirtualDisplayDriver\MttVDD.inf Root\MttVDD
+```
+
+(or run the bundled `VDD Control.exe` and click Install). Then:
+
+```bash
+spacedesk-server --virtual --allow-input   # extended mode; the virtual monitor is resized to each viewer
+spacedesk-server --list-displays           # show monitors and which one --virtual uses
+spacedesk-server                           # mirror the primary display instead
+```
+
+Stop spacedesk's own service first if it's installed — both use port 28252. Connections are
+**unauthenticated and unencrypted**: anyone on your LAN can view the streamed display, and with
+`--allow-input` control this PC. Use it only on a network you trust.
 
 ## Roadmap
 
 - [x] Milestone 1: JPEG display + input
 - [x] H.264 (encoding 4) on Android via hardware `MediaCodec` (toggle in the app; default on)
 - [x] H.264 on desktop (Rust) via OpenH264 (`--h264`), loading Cisco's prebuilt library at runtime
+- [x] Open-source Windows server with true extended display (Virtual Display Driver)
+- [ ] Server: PIN/TLS authentication, H.264 encode, real multi-touch injection
 - [ ] Verify + finalize input field semantics against the live server
 - [ ] Audio (type 14 speaker session)
 - [ ] Mobile (Android/iOS) front-ends over the same `spacedesk-proto` core

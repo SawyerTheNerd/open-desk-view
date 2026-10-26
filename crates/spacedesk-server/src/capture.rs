@@ -7,7 +7,8 @@ use std::ffi::c_void;
 use windows::Win32::Foundation::{BOOL, LPARAM, RECT};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    GetSystemMetrics, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN,
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
 
 pub struct Frame {
@@ -123,6 +124,18 @@ pub fn capture_display(d: &Display) -> Option<Frame> {
     capture_rect(d.left, d.top, d.width, d.height)
 }
 
+/// Bounding box of the whole virtual desktop: (left, top, width, height).
+pub fn virtual_screen() -> (i32, i32, i32, i32) {
+    unsafe {
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        )
+    }
+}
+
 /// Find a monitor by its stable device name (e.g. "\\.\DISPLAY2"). Identity is re-checked
 /// this way each frame so a requested display is never silently confused with another.
 pub fn find_display_by_name(name: &str) -> Option<Display> {
@@ -135,7 +148,6 @@ pub fn capture_primary() -> Option<Frame> {
         let w = GetSystemMetrics(SM_CXSCREEN);
         let h = GetSystemMetrics(SM_CYSCREEN);
         // Primary's top-left is the origin of GetDC(None), so source (0,0).
-        let _ = (SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN); // referenced for clarity
         capture_rect(0, 0, w, h)
     }
 }

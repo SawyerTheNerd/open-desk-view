@@ -4,7 +4,9 @@
 //! Usage:
 //!   spacedesk-server                 # serve the primary display, VIEW-ONLY (JPEG q80)
 //!   spacedesk-server --list-displays # list monitors (index, size, primary) and exit
-//!   spacedesk-server --display 1     # serve a specific monitor (e.g. a virtual extended display)
+//!   spacedesk-server --display 1     # serve a specific monitor
+//!   spacedesk-server --virtual       # EXTENDED mode: serve the Virtual Display Driver monitor,
+//!                                    #   resized to each viewer's screen
 //!   spacedesk-server --allow-input   # also let the viewer control mouse/keyboard/touch
 //!   spacedesk-server --bind 127.0.0.1  # restrict to this machine only (default 0.0.0.0 = LAN)
 //!   spacedesk-server --quality 60    # lower quality / less bandwidth
@@ -12,6 +14,8 @@
 
 #[cfg(windows)]
 mod capture;
+#[cfg(windows)]
+mod display;
 #[cfg(windows)]
 mod inject;
 #[cfg(windows)]
@@ -33,6 +37,10 @@ fn main() {
                 if d.primary { " PRIMARY" } else { "" },
                 d.name
             );
+        }
+        match display::find_virtual_display() {
+            Some(n) => println!("virtual display (--virtual): {n}"),
+            None => println!("virtual display (--virtual): not found"),
         }
         return;
     }
@@ -65,7 +73,15 @@ fn main() {
         }
     }
 
-    if let Err(e) = server::run(quality, &bind, allow_input, display) {
+    let target = if args.iter().any(|a| a == "--virtual") {
+        server::Target::Virtual
+    } else if let Some(i) = display {
+        server::Target::Index(i)
+    } else {
+        server::Target::Primary
+    };
+
+    if let Err(e) = server::run(quality, &bind, allow_input, target) {
         eprintln!("server error: {e}");
         std::process::exit(1);
     }
