@@ -217,10 +217,20 @@ fn inject_touch(h: &Header) {
 fn discovery_responder(bind: &str) -> std::io::Result<()> {
     let sock = UdpSocket::bind((bind, PORT))?;
     let mut buf = [0u8; 2048];
-    // Per-source rate limit so the responder can't be used as a UDP reflector/amplifier:
-    // at most one reply per source IP per window.
+
+    // Reflection/amplification defenses. The reply (308 B) is larger than the probe
+    // (~20 B), so an unbounded responder could be abused as a UDP amplifier.
+    const MIN_INTERVAL: Duration = Duration::from_millis(500); // per-source min gap
+    const MAX_TRACKED: usize = 4096; // hard cap on the per-IP map
+    const PRUNE_EVERY: Duration = Duration::from_secs(1); // timer-based pruning
+    const STALE_AFTER: Duration = Duration::from_secs(60);
+    const GLOBAL_MAX_PER_SEC: u32 = 50; // total replies/sec across all sources
+
     let mut last_reply: HashMap<IpAddr, Instant> = HashMap::new();
-    const MIN_INTERVAL: Duration = Duration::from_millis(500);
+    let mut last_prune = Instant::now();
+    let mut window_start = Instant::now();
+    let mut window_count: u32 = 0;
+
     loop {
         let (n, from) = sock.recv_from(&mut buf)?;
         // Require the full magic token, not just a prefix, to reduce spoofed triggers.
@@ -228,17 +238,35 @@ fn discovery_responder(bind: &str) -> std::io::Result<()> {
             continue;
         }
         let now = Instant::now();
+
+        // Prune stale entries on a timer, not on every packet.
+        if now.duration_since(last_prune) >= PRUNE_EVERY {
+            last_reply.retain(|_, t| now.duration_since(*t) < STALE_AFTER);
+            last_prune = now;
+        }
+
+        // Global cap: never emit more than GLOBAL_MAX_PER_SEC replies in any 1s window.
+        if now.duration_since(window_start) >= Duration::from_secs(1) {
+            window_start = now;
+            window_count = 0;
+        }
+        if window_count >= GLOBAL_MAX_PER_SEC {
+            continue;
+        }
+
+        // Per-source cap.
         let ip = from.ip();
         if let Some(t) = last_reply.get(&ip) {
             if now.duration_since(*t) < MIN_INTERVAL {
                 continue;
             }
-        }
-        // Occasionally prune stale entries so the map can't grow unbounded.
-        if last_reply.len() > 1024 {
-            last_reply.retain(|_, t| now.duration_since(*t) < Duration::from_secs(60));
+        } else if last_reply.len() >= MAX_TRACKED {
+            // Map is full of other recent sources; drop rather than grow unbounded.
+            continue;
         }
         last_reply.insert(ip, now);
+
+        window_count += 1;
         let reply = build_discovery_reply();
         let _ = sock.send_to(&reply, from);
     }
