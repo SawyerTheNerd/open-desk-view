@@ -17,7 +17,7 @@ use crate::{capture, inject};
 
 const PORT: u16 = proto::DEFAULT_PORT;
 
-pub fn run(quality: u8, bind: &str, allow_input: bool) -> std::io::Result<()> {
+pub fn run(quality: u8, bind: &str, allow_input: bool, display: Option<usize>) -> std::io::Result<()> {
     // Discovery listens on the same interface as the TCP server, so --bind 127.0.0.1
     // keeps discovery local too instead of reflecting replies to the whole LAN.
     let disco_bind = bind.to_string();
@@ -39,12 +39,16 @@ pub fn run(quality: u8, bind: &str, allow_input: bool) -> std::io::Result<()> {
     } else {
         eprintln!("[server]   Input injection is OFF (view-only). Pass --allow-input to let viewers control this PC.");
     }
+    match display {
+        Some(i) => println!("[server] serving display index {i} (use --list-displays to see them)"),
+        None => println!("[server] serving the primary display"),
+    }
 
     for stream in listener.incoming() {
         match stream {
             Ok(s) => {
                 std::thread::spawn(move || {
-                    if let Err(e) = handle_client(s, quality, allow_input) {
+                    if let Err(e) = handle_client(s, quality, allow_input, display) {
                         eprintln!("[server] client ended: {e}");
                     }
                 });
@@ -55,9 +59,25 @@ pub fn run(quality: u8, bind: &str, allow_input: bool) -> std::io::Result<()> {
     Ok(())
 }
 
-fn handle_client(stream: TcpStream, quality: u8, allow_input: bool) -> std::io::Result<()> {
+fn handle_client(
+    stream: TcpStream,
+    quality: u8,
+    allow_input: bool,
+    display: Option<usize>,
+) -> std::io::Result<()> {
     let peer = stream.peer_addr().ok();
     println!("[server] client connected: {peer:?} (input {})", if allow_input { "ENABLED" } else { "off" });
+
+    // Resolve the requested monitor at connect time (so a virtual display added after
+    // startup is picked up). Falls back to the primary if the index is out of range.
+    let target: Option<capture::Display> = display.and_then(|i| {
+        let list = capture::list_displays();
+        let found = list.into_iter().find(|d| d.index == i);
+        if found.is_none() {
+            eprintln!("[server] display index {i} not found; using primary");
+        }
+        found
+    });
     stream.set_nodelay(true).ok();
     let mut reader = stream.try_clone()?;
     let mut writer = stream;
@@ -119,7 +139,7 @@ fn handle_client(stream: TcpStream, quality: u8, allow_input: bool) -> std::io::
             }
         }
 
-        let frame = match capture::capture_primary() {
+        let frame = match target.as_ref().and_then(capture::capture_display).or_else(capture::capture_primary) {
             Some(f) => f,
             None => {
                 std::thread::sleep(Duration::from_millis(50));

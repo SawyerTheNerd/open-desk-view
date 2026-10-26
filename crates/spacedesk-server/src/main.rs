@@ -3,6 +3,8 @@
 //!
 //! Usage:
 //!   spacedesk-server                 # serve the primary display, VIEW-ONLY (JPEG q80)
+//!   spacedesk-server --list-displays # list monitors (index, size, primary) and exit
+//!   spacedesk-server --display 1     # serve a specific monitor (e.g. a virtual extended display)
 //!   spacedesk-server --allow-input   # also let the viewer control mouse/keyboard/touch
 //!   spacedesk-server --bind 127.0.0.1  # restrict to this machine only (default 0.0.0.0 = LAN)
 //!   spacedesk-server --quality 60    # lower quality / less bandwidth
@@ -19,8 +21,31 @@ mod server;
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
+    if args.iter().any(|a| a == "--list-displays") {
+        for d in capture::list_displays() {
+            println!(
+                "display {}: {}x{} at ({},{}){}  [{}]",
+                d.index,
+                d.width,
+                d.height,
+                d.left,
+                d.top,
+                if d.primary { " PRIMARY" } else { "" },
+                d.name
+            );
+        }
+        return;
+    }
+
+    let mut display: Option<usize> = None;
+    if let Some(i) = args.iter().position(|a| a == "--display") {
+        if let Some(v) = args.get(i + 1).and_then(|s| s.parse::<usize>().ok()) {
+            display = Some(v);
+        }
+    }
+
     if args.iter().any(|a| a == "--capture-test") {
-        capture_test();
+        capture_test(display);
         return;
     }
 
@@ -40,16 +65,23 @@ fn main() {
         }
     }
 
-    if let Err(e) = server::run(quality, &bind, allow_input) {
+    if let Err(e) = server::run(quality, &bind, allow_input, display) {
         eprintln!("server error: {e}");
         std::process::exit(1);
     }
 }
 
 #[cfg(windows)]
-fn capture_test() {
+fn capture_test(display: Option<usize>) {
     use jpeg_encoder::{ColorType, Encoder};
-    match capture::capture_primary() {
+    let frame = match display {
+        Some(i) => capture::list_displays()
+            .into_iter()
+            .find(|d| d.index == i)
+            .and_then(|d| capture::capture_display(&d)),
+        None => capture::capture_primary(),
+    };
+    match frame {
         Some(f) => {
             let rgb = capture::bgra_to_rgb(&f.bgra, f.w, f.h);
             let mut out = Vec::new();
