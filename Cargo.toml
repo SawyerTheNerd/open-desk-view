@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/spacedesk-proto",
     "crates/spacedesk-viewer",
+    "crates/spacedesk-server",
 ]
 
 [workspace.package]
