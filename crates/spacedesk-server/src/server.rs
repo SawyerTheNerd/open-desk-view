@@ -6,16 +6,20 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener, TcpStream, UdpSocket};
-use std::sync::mpsc::channel;
+use std::sync::mpsc::{channel, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use jpeg_encoder::{ColorType, Encoder};
 use proto::{Encoding, Header, MsgType, HEADER_LEN};
 use spacedesk_proto as proto;
 
-use crate::{capture, display, inject};
+use crate::{capture, display, h264, inject};
 
 const PORT: u16 = proto::DEFAULT_PORT;
+/// Unacknowledged H.264 frames allowed in flight (covers the viewer decoder's buffering).
+const H264_WINDOW: u32 = 3;
+/// Frame-rate cap (60 fps).
+const MIN_FRAME_INTERVAL: Duration = Duration::from_micros(16_667);
 
 /// Which monitor a session streams.
 #[derive(Clone, Copy)]
@@ -96,9 +100,13 @@ fn handle_client(
         reader.read_exact(&mut p)?;
     }
     let (req_w, req_h) = if h.get_u32(48) >= 1 { (h.get_u32(52), h.get_u32(88)) } else { (0, 0) };
+    // Requested encoding lives at offset 36 when the extended-identification flag (byte 38) is set.
+    let req_enc = if h.bytes[38] & 0x01 != 0 { u16::from_le_bytes([h.bytes[36], h.bytes[37]]) as u32 } else { 0 };
+    let mut use_h264 = req_enc == Encoding::H264 as u32 || req_enc == Encoding::ServerChoice as u32;
     println!(
-        "[server] identification ok (client type {}, wants {req_w}x{req_h})",
-        h.get_u32(16)
+        "[server] identification ok (client type {}, wants {req_w}x{req_h}, {})",
+        h.get_u32(16),
+        if use_h264 { "H.264" } else { "JPEG" }
     );
 
     // Resolve the requested monitor to its STABLE device name. We identify by name (not
@@ -161,21 +169,42 @@ fn handle_client(
         }
     });
 
-    // Sender loop: capture -> JPEG -> framebuffer, paced by flow-control acks.
+    // Sender loop: capture -> encode -> framebuffer, paced by flow-control acks.
+    let mut encoder: Option<h264::H264Encoder> = None;
     let mut last_ping = Instant::now();
-    let mut have_credit = true; // send the first frame immediately
+    let mut last_frame = Instant::now() - MIN_FRAME_INTERVAL;
+    let mut in_flight: u32 = 0;
     let mut frames: u64 = 0;
+    let mut bytes: u64 = 0;
     let mut fps_t = Instant::now();
     loop {
-        if !have_credit {
-            // wait for the viewer to ack the previous frame before sending the next
-            if ack_rx.recv_timeout(Duration::from_secs(2)).is_err() {
-                // no ack in time; send a ping to check liveness and continue
-                if writer.write_all(&proto::build_ping()).is_err() {
-                    break;
+        while ack_rx.try_recv().is_ok() {
+            in_flight = in_flight.saturating_sub(1);
+        }
+        // H.264 decoders hold a frame or two, so keep a few in flight; JPEG viewers ack each
+        // frame as soon as it's painted.
+        let window = if use_h264 { H264_WINDOW } else { 1 };
+        if in_flight >= window {
+            match ack_rx.recv_timeout(Duration::from_secs(2)) {
+                Ok(()) => in_flight -= 1,
+                Err(RecvTimeoutError::Disconnected) => break, // reader thread ended: client gone
+                Err(RecvTimeoutError::Timeout) => {
+                    // No ack for 2s: check liveness, then let one frame through so a stalled
+                    // viewer pipeline can drain instead of deadlocking.
+                    if writer.write_all(&proto::build_ping()).is_err() {
+                        break;
+                    }
+                    in_flight -= 1;
                 }
             }
         }
+
+        // Cap the frame rate so a fast viewer doesn't make us spin on a static screen.
+        let since = last_frame.elapsed();
+        if since < MIN_FRAME_INTERVAL {
+            std::thread::sleep(MIN_FRAME_INTERVAL - since);
+        }
+        last_frame = Instant::now();
 
         // Re-resolve the target by name each frame. If a requested display has gone away,
         // skip the frame and wait for it to return — never substitute the primary.
@@ -195,25 +224,55 @@ fn handle_client(
                 }
             },
         };
-        let rgb = capture::bgra_to_rgb(&frame.bgra, frame.w, frame.h);
-        let mut jpeg = Vec::new();
-        if Encoder::new(&mut jpeg, quality)
-            .encode(&rgb, frame.w as u16, frame.h as u16, ColorType::Rgb)
-            .is_err()
-        {
-            continue;
-        }
+        let (payload, encoding, w, h) = if use_h264 {
+            let (bgra, w, h) = h264::even_frame(frame.bgra, frame.w as usize, frame.h as usize);
+            if encoder.as_ref().map_or(true, |e| e.dimensions() != (w, h)) {
+                match h264::H264Encoder::new(w, h, h264_bitrate(w, h)) {
+                    Ok(e) => {
+                        println!("[server] H.264 encoder {w}x{h} @ {} kbps", h264_bitrate(w, h) / 1000);
+                        encoder = Some(e);
+                    }
+                    Err(e) => {
+                        eprintln!("[server] H.264 unavailable ({e}); falling back to JPEG");
+                        use_h264 = false;
+                        continue;
+                    }
+                }
+            }
+            match encoder.as_mut().and_then(|e| e.encode(&bgra)) {
+                Some(au) => (au, Encoding::H264, w as u32, h as u32),
+                None => continue,
+            }
+        } else {
+            let rgb = capture::bgra_to_rgb(&frame.bgra, frame.w, frame.h);
+            let mut jpeg = Vec::new();
+            if Encoder::new(&mut jpeg, quality)
+                .encode(&rgb, frame.w as u16, frame.h as u16, ColorType::Rgb)
+                .is_err()
+            {
+                continue;
+            }
+            (jpeg, Encoding::Jpeg, frame.w, frame.h)
+        };
 
-        let msg = build_framebuffer(frame.w, frame.h, &jpeg);
+        let msg = build_framebuffer(w, h, &payload, encoding);
         if writer.write_all(&msg).is_err() {
             break;
         }
-        have_credit = false;
+        in_flight += 1;
         frames += 1;
+        bytes += payload.len() as u64;
         if fps_t.elapsed() >= Duration::from_secs(2) {
-            let fps = frames as f64 / fps_t.elapsed().as_secs_f64();
-            println!("[server] {fps:.1} fps ({}x{}, {} KB/frame)", frame.w, frame.h, jpeg.len() / 1024);
+            let secs = fps_t.elapsed().as_secs_f64();
+            println!(
+                "[server] {:.1} fps ({w}x{h} {}, {} KB/frame, {:.1} Mbps)",
+                frames as f64 / secs,
+                if use_h264 { "H.264" } else { "JPEG" },
+                bytes / frames.max(1) / 1024,
+                bytes as f64 * 8.0 / secs / 1e6
+            );
             frames = 0;
+            bytes = 0;
             fps_t = Instant::now();
         }
 
@@ -221,19 +280,20 @@ fn handle_client(
             let _ = writer.write_all(&proto::build_ping());
             last_ping = Instant::now();
         }
-
-        // drain any extra acks so credit tracks reality
-        while ack_rx.try_recv().is_ok() {
-            have_credit = true;
-        }
     }
     println!("[server] client disconnected: {peer:?}");
     Ok(())
 }
 
-fn build_framebuffer(w: u32, h: u32, jpeg: &[u8]) -> Vec<u8> {
+/// H.264 bitrate scaled to resolution (~8 bits/pixel/s): 1366x768 ≈ 8 Mbps, 1080p ≈ 16 Mbps.
+fn h264_bitrate(w: usize, h: usize) -> u32 {
+    ((w * h) as u64 * 8).clamp(2_000_000, 20_000_000) as u32
+}
+
+/// One full-frame framebuffer message: a whole JPEG image or one H.264 access unit.
+fn build_framebuffer(w: u32, h: u32, payload: &[u8], encoding: Encoding) -> Vec<u8> {
     let mut hd = Header::new(MsgType::Framebuffer);
-    hd.set_u32(4, jpeg.len() as u32); // payloadLen
+    hd.set_u32(4, payload.len() as u32); // payloadLen
     hd.set_u32(8, w); // width
     hd.set_u32(12, h); // height
     hd.set_u32(16, w * 4); // pitch
@@ -242,13 +302,13 @@ fn build_framebuffer(w: u32, h: u32, jpeg: &[u8]) -> Vec<u8> {
     hd.set_u32(28, 0); // rect top
     hd.set_u32(32, w); // rect right
     hd.set_u32(36, h); // rect bottom
-    hd.set_u32(40, Encoding::Jpeg as u32); // encoding
+    hd.set_u32(40, encoding as u32); // encoding
     hd.set_u32(60, 1); // fragment count
     hd.set_u32(64, 0); // fragmentInfo: 0 = whole frame
-    hd.set_u32(68, jpeg.len() as u32); // payloadSize
-    let mut msg = Vec::with_capacity(HEADER_LEN + jpeg.len());
+    hd.set_u32(68, payload.len() as u32); // payloadSize
+    let mut msg = Vec::with_capacity(HEADER_LEN + payload.len());
     msg.extend_from_slice(&hd.bytes);
-    msg.extend_from_slice(jpeg);
+    msg.extend_from_slice(payload);
     msg
 }
 

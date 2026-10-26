@@ -17,6 +17,8 @@ mod capture;
 #[cfg(windows)]
 mod display;
 #[cfg(windows)]
+mod h264;
+#[cfg(windows)]
 mod inject;
 #[cfg(windows)]
 mod server;
