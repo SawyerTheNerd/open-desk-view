@@ -3,8 +3,9 @@
 //! so the OpenDeskView viewer connects to it with no changes.
 #![cfg(windows)]
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream, UdpSocket};
+use std::net::{IpAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::mpsc::channel;
 use std::time::{Duration, Instant};
 
@@ -17,8 +18,11 @@ use crate::{capture, inject};
 const PORT: u16 = proto::DEFAULT_PORT;
 
 pub fn run(quality: u8, bind: &str, allow_input: bool) -> std::io::Result<()> {
-    std::thread::spawn(|| {
-        if let Err(e) = discovery_responder() {
+    // Discovery listens on the same interface as the TCP server, so --bind 127.0.0.1
+    // keeps discovery local too instead of reflecting replies to the whole LAN.
+    let disco_bind = bind.to_string();
+    std::thread::spawn(move || {
+        if let Err(e) = discovery_responder(&disco_bind) {
             eprintln!("[server] discovery responder stopped: {e}");
         }
     });
@@ -210,15 +214,33 @@ fn inject_touch(h: &Header) {
     }
 }
 
-fn discovery_responder() -> std::io::Result<()> {
-    let sock = UdpSocket::bind(("0.0.0.0", PORT))?;
+fn discovery_responder(bind: &str) -> std::io::Result<()> {
+    let sock = UdpSocket::bind((bind, PORT))?;
     let mut buf = [0u8; 2048];
+    // Per-source rate limit so the responder can't be used as a UDP reflector/amplifier:
+    // at most one reply per source IP per window.
+    let mut last_reply: HashMap<IpAddr, Instant> = HashMap::new();
+    const MIN_INTERVAL: Duration = Duration::from_millis(500);
     loop {
         let (n, from) = sock.recv_from(&mut buf)?;
-        if buf[..n].starts_with(b"SPACEDESK-NET-CLIENT") {
-            let reply = build_discovery_reply();
-            let _ = sock.send_to(&reply, from);
+        // Require the full magic token, not just a prefix, to reduce spoofed triggers.
+        if !buf[..n].starts_with(b"SPACEDESK-NET-CLIENT") {
+            continue;
         }
+        let now = Instant::now();
+        let ip = from.ip();
+        if let Some(t) = last_reply.get(&ip) {
+            if now.duration_since(*t) < MIN_INTERVAL {
+                continue;
+            }
+        }
+        // Occasionally prune stale entries so the map can't grow unbounded.
+        if last_reply.len() > 1024 {
+            last_reply.retain(|_, t| now.duration_since(*t) < Duration::from_secs(60));
+        }
+        last_reply.insert(ip, now);
+        let reply = build_discovery_reply();
+        let _ = sock.send_to(&reply, from);
     }
 }
 
