@@ -7,7 +7,8 @@ use std::ffi::c_void;
 use windows::Win32::Foundation::{BOOL, LPARAM, RECT};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN,
+    DrawIconEx, GetCursorInfo, GetIconInfo, GetSystemMetrics, CURSORINFO, CURSOR_SHOWING, DI_NORMAL,
+    HICON, ICONINFO, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN,
     SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
 
@@ -87,6 +88,8 @@ fn capture_rect(left: i32, top: i32, w: i32, h: i32) -> Option<Frame> {
         // Source origin is in virtual-screen space; GetDC(None) maps (0,0) to the primary's
         // top-left, so other monitors sit at their signed offsets.
         let _ = BitBlt(mem, 0, 0, w, h, screen, left, top, SRCCOPY);
+        // BitBlt never includes the mouse pointer; draw it in ourselves.
+        draw_cursor(mem, left, top);
 
         let mut bi = BITMAPINFO::default();
         bi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
@@ -117,6 +120,33 @@ fn capture_rect(left: i32, top: i32, w: i32, h: i32) -> Option<Frame> {
         }
         Some(Frame { w: w as u32, h: h as u32, bgra: buf })
     }
+}
+
+/// Draw the current mouse cursor into `dc`, whose origin sits at (`left`, `top`) of the virtual
+/// desktop. Does nothing when the cursor is hidden; off-monitor positions are simply clipped.
+unsafe fn draw_cursor(dc: HDC, left: i32, top: i32) {
+    let mut ci = CURSORINFO {
+        cbSize: std::mem::size_of::<CURSORINFO>() as u32,
+        ..Default::default()
+    };
+    if GetCursorInfo(&mut ci).is_err() || ci.flags.0 & CURSOR_SHOWING.0 == 0 || ci.hCursor.is_invalid() {
+        return;
+    }
+    let icon = HICON(ci.hCursor.0);
+    let mut ii = ICONINFO::default();
+    if GetIconInfo(icon, &mut ii).is_err() {
+        return;
+    }
+    // GetIconInfo hands us copies of the cursor bitmaps; free them.
+    if !ii.hbmMask.is_invalid() {
+        let _ = DeleteObject(HGDIOBJ(ii.hbmMask.0));
+    }
+    if !ii.hbmColor.is_invalid() {
+        let _ = DeleteObject(HGDIOBJ(ii.hbmColor.0));
+    }
+    let x = ci.ptScreenPos.x - left - ii.xHotspot as i32;
+    let y = ci.ptScreenPos.y - top - ii.yHotspot as i32;
+    let _ = DrawIconEx(dc, x, y, icon, 0, 0, 0, None, DI_NORMAL);
 }
 
 /// Capture a specific monitor.

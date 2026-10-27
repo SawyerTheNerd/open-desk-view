@@ -6,7 +6,9 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener, TcpStream, UdpSocket};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{channel, RecvTimeoutError};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use jpeg_encoder::{ColorType, Encoder};
@@ -140,6 +142,9 @@ fn handle_client(
 
     let (ack_tx, ack_rx) = channel::<()>();
     let input_target = target_name.clone();
+    // Input messages received from the viewer since the last stats line (diagnostics).
+    let input_events = Arc::new(AtomicU32::new(0));
+    let input_events_rx = input_events.clone();
 
     // Reader thread: flow-control acks + input + client pings.
     std::thread::spawn(move || {
@@ -156,7 +161,11 @@ fn handle_client(
                     break;
                 }
             }
-            match hh.msg_type() {
+            let ty = hh.msg_type();
+            if matches!(ty, MsgType::Mouse | MsgType::Keyboard | MsgType::Touch) {
+                input_events_rx.fetch_add(1, Ordering::Relaxed);
+            }
+            match ty {
                 MsgType::FlowControlAck => {
                     let _ = ack_tx.send(());
                 }
@@ -264,12 +273,18 @@ fn handle_client(
         bytes += payload.len() as u64;
         if fps_t.elapsed() >= Duration::from_secs(2) {
             let secs = fps_t.elapsed().as_secs_f64();
+            let inputs = input_events.swap(0, Ordering::Relaxed);
             println!(
-                "[server] {:.1} fps ({w}x{h} {}, {} KB/frame, {:.1} Mbps)",
+                "[server] {:.1} fps ({w}x{h} {}, {} KB/frame, {:.1} Mbps){}",
                 frames as f64 / secs,
                 if use_h264 { "H.264" } else { "JPEG" },
                 bytes / frames.max(1) / 1024,
-                bytes as f64 * 8.0 / secs / 1e6
+                bytes as f64 * 8.0 / secs / 1e6,
+                match (inputs, allow_input) {
+                    (0, _) => String::new(),
+                    (n, true) => format!(", {n} input events"),
+                    (n, false) => format!(", {n} input events IGNORED (no --allow-input)"),
+                }
             );
             frames = 0;
             bytes = 0;

@@ -25,6 +25,15 @@ mod server;
 
 #[cfg(windows)]
 fn main() {
+    // Work in physical pixels on every monitor, so capture rects, cursor positions and input
+    // coordinates all agree even when displays use different scaling.
+    unsafe {
+        use windows::Win32::UI::HiDpi::{
+            SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        };
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     if args.iter().any(|a| a == "--list-displays") {
