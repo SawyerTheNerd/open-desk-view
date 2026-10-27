@@ -64,27 +64,29 @@ impl H264Encoder {
         (self.w, self.h)
     }
 
-    /// Encode one top-down BGRA frame of exactly `dimensions()`. Returns one Annex-B access unit
-    /// (SPS/PPS are included with every IDR), or None if the encoder produced nothing.
-    pub fn encode(&mut self, bgra: &[u8]) -> Option<Vec<u8>> {
+    /// Encode one top-down BGRA frame of exactly `dimensions()` into `out` as one Annex-B access
+    /// unit (SPS/PPS are included with every IDR). Returns false if the encoder produced nothing.
+    pub fn encode(&mut self, bgra: &[u8], out: &mut Vec<u8>) -> bool {
         self.yuv.read_bgra8(BgraSliceU8::new(bgra, (self.w, self.h)));
-        let au = self.enc.encode(&self.yuv).ok()?.to_vec();
-        (!au.is_empty()).then_some(au)
+        out.clear();
+        match self.enc.encode(&self.yuv) {
+            Ok(bs) => bs.write_vec(out),
+            Err(_) => return false,
+        }
+        !out.is_empty()
     }
 }
 
-/// Crop a top-down BGRA frame of `w`x`h` to even dimensions (needed for 4:2:0), copying only
-/// when a dimension is odd.
-pub fn even_frame(bgra: Vec<u8>, w: usize, h: usize) -> (Vec<u8>, usize, usize) {
+/// View a top-down BGRA frame of `w`x`h` cropped to even dimensions (needed for 4:2:0). Borrows
+/// `bgra` directly when the width is already even; otherwise copies the cropped rows to `scratch`.
+pub fn even_view<'a>(bgra: &'a [u8], w: usize, h: usize, scratch: &'a mut Vec<u8>) -> (&'a [u8], usize, usize) {
     let (ew, eh) = (w & !1, h & !1);
     if ew == w {
-        let mut v = bgra;
-        v.truncate(ew * eh * 4);
-        return (v, ew, eh);
+        return (&bgra[..ew * eh * 4], ew, eh);
     }
-    let mut out = Vec::with_capacity(ew * eh * 4);
+    scratch.clear();
     for row in bgra.chunks_exact(w * 4).take(eh) {
-        out.extend_from_slice(&row[..ew * 4]);
+        scratch.extend_from_slice(&row[..ew * 4]);
     }
-    (out, ew, eh)
+    (scratch, ew, eh)
 }

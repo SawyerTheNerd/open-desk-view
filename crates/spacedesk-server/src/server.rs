@@ -15,13 +15,15 @@ use jpeg_encoder::{ColorType, Encoder};
 use proto::{Encoding, Header, MsgType, HEADER_LEN};
 use spacedesk_proto as proto;
 
+use crate::settings::Settings;
 use crate::{capture, display, h264, inject};
 
 const PORT: u16 = proto::DEFAULT_PORT;
 /// Unacknowledged H.264 frames allowed in flight (covers the viewer decoder's buffering).
 const H264_WINDOW: u32 = 3;
-/// Frame-rate cap (60 fps).
-const MIN_FRAME_INTERVAL: Duration = Duration::from_micros(16_667);
+/// After this long without a screen change, poll at the slower `Settings::idle_poll` rate.
+const IDLE_AFTER: Duration = Duration::from_secs(1);
+const STATS_EVERY: Duration = Duration::from_secs(2);
 
 /// Which monitor a session streams.
 #[derive(Clone, Copy)]
@@ -34,7 +36,13 @@ pub enum Target {
     Virtual,
 }
 
-pub fn run(quality: u8, bind: &str, allow_input: bool, target: Target) -> std::io::Result<()> {
+pub fn run(
+    settings: Settings,
+    bind: &str,
+    allow_input: bool,
+    target: Target,
+    allow_h264: bool,
+) -> std::io::Result<()> {
     // Discovery listens on the same interface as the TCP server, so --bind 127.0.0.1
     // keeps discovery local too instead of reflecting replies to the whole LAN.
     let disco_bind = bind.to_string();
@@ -45,7 +53,17 @@ pub fn run(quality: u8, bind: &str, allow_input: bool, target: Target) -> std::i
     });
 
     let listener = TcpListener::bind((bind, PORT))?;
-    println!("[server] listening on {bind}:{PORT} (JPEG q{quality})");
+    println!("[server] listening on {bind}:{PORT}");
+    println!(
+        "[server] limits: up to {} fps, JPEG q{}, H.264 {}, idle poll {} ms",
+        settings.max_fps,
+        settings.jpeg_quality,
+        match settings.bitrate_kbps {
+            Some(k) => format!("{k} kbps"),
+            None => format!("{} bits/pixel/s", settings.h264_bits_per_pixel),
+        },
+        settings.idle_poll.as_millis()
+    );
     eprintln!("[server] SECURITY: connections are UNAUTHENTICATED and UNENCRYPTED.");
     if bind == "0.0.0.0" {
         eprintln!("[server]   Anyone who can reach this PC on the LAN can VIEW this screen.");
@@ -55,6 +73,12 @@ pub fn run(quality: u8, bind: &str, allow_input: bool, target: Target) -> std::i
         eprintln!("[server]   INPUT INJECTION IS ENABLED — a connected viewer can control mouse/keyboard.");
     } else {
         eprintln!("[server]   Input injection is OFF (view-only). Pass --allow-input to let viewers control this PC.");
+    }
+    if allow_h264 {
+        println!("[server] H.264 available for viewers that ask for it (--no-h264 to disable).");
+        println!("[server]   OpenH264 Video Codec provided by Cisco Systems, Inc.");
+    } else {
+        println!("[server] H.264 disabled (--no-h264): streaming JPEG only.");
     }
     match target {
         Target::Primary => println!("[server] serving the primary display (mirror)"),
@@ -69,7 +93,7 @@ pub fn run(quality: u8, bind: &str, allow_input: bool, target: Target) -> std::i
         match stream {
             Ok(s) => {
                 std::thread::spawn(move || {
-                    if let Err(e) = handle_client(s, quality, allow_input, target) {
+                    if let Err(e) = handle_client(s, settings, allow_input, target, allow_h264) {
                         eprintln!("[server] client ended: {e}");
                     }
                 });
@@ -82,9 +106,10 @@ pub fn run(quality: u8, bind: &str, allow_input: bool, target: Target) -> std::i
 
 fn handle_client(
     stream: TcpStream,
-    quality: u8,
+    settings: Settings,
     allow_input: bool,
     target: Target,
+    allow_h264: bool,
 ) -> std::io::Result<()> {
     let peer = stream.peer_addr().ok();
     println!("[server] client connected: {peer:?} (input {})", if allow_input { "ENABLED" } else { "off" });
@@ -104,9 +129,15 @@ fn handle_client(
     let (req_w, req_h) = if h.get_u32(48) >= 1 { (h.get_u32(52), h.get_u32(88)) } else { (0, 0) };
     // Requested encoding lives at offset 36 when the extended-identification flag (byte 38) is set.
     let req_enc = if h.bytes[38] & 0x01 != 0 { u16::from_le_bytes([h.bytes[36], h.bytes[37]]) as u32 } else { 0 };
-    let mut use_h264 = req_enc == Encoding::H264 as u32 || req_enc == Encoding::ServerChoice as u32;
+    let mut use_h264 =
+        allow_h264 && (req_enc == Encoding::H264 as u32 || req_enc == Encoding::ServerChoice as u32);
+    // The viewer's preferred quality (1-100) and frame rate; our settings are the ceiling.
+    let req_quality = h.get_u32(32);
+    let req_fps = u16::from_le_bytes([h.bytes[44], h.bytes[45]]) as u32;
+    let fps = settings.fps_for(req_fps);
+    let jpeg_quality = settings.jpeg_quality_for(req_quality);
     println!(
-        "[server] identification ok (client type {}, wants {req_w}x{req_h}, {})",
+        "[server] identification ok (client type {}, wants {req_w}x{req_h} {} q{req_quality} {req_fps} fps) -> up to {fps} fps",
         h.get_u32(16),
         if use_h264 { "H.264" } else { "JPEG" }
     );
@@ -178,15 +209,36 @@ fn handle_client(
         }
     });
 
-    // Sender loop: capture -> encode -> framebuffer, paced by flow-control acks.
+    // Sender loop: capture -> (skip if unchanged) -> encode -> framebuffer, paced by the frame
+    // rate and flow-control acks. All buffers are reused, so steady state allocates nothing.
+    let source_name = target_name.clone().unwrap_or_else(|| capture::primary_display().name);
+    let mut source = capture::Source::new(&source_name);
+    let frame_interval = Duration::from_secs_f64(1.0 / fps as f64);
     let mut encoder: Option<h264::H264Encoder> = None;
+    let mut cur: Vec<u8> = Vec::new(); // this capture (BGRA)
+    let mut prev: Vec<u8> = Vec::new(); // last capture we sent
+    let mut scratch: Vec<u8> = Vec::new(); // odd-width crop for H.264
+    let mut payload: Vec<u8> = Vec::new(); // encoded frame
+    let mut msg: Vec<u8> = Vec::new(); // header + payload
     let mut last_ping = Instant::now();
-    let mut last_frame = Instant::now() - MIN_FRAME_INTERVAL;
+    let mut last_frame = Instant::now() - frame_interval;
+    let mut last_change = Instant::now();
     let mut in_flight: u32 = 0;
-    let mut frames: u64 = 0;
-    let mut bytes: u64 = 0;
-    let mut fps_t = Instant::now();
+    let mut stats = Stats::default();
+    let mut stats_t = Instant::now();
     loop {
+        if stats_t.elapsed() >= STATS_EVERY {
+            stats.print(stats_t.elapsed(), use_h264, input_events.swap(0, Ordering::Relaxed), allow_input);
+            stats = Stats { dims: stats.dims, ..Stats::default() };
+            stats_t = Instant::now();
+        }
+        if last_ping.elapsed() > Duration::from_secs(2) {
+            if writer.write_all(&proto::build_ping()).is_err() {
+                break;
+            }
+            last_ping = Instant::now();
+        }
+
         while ack_rx.try_recv().is_ok() {
             in_flight = in_flight.saturating_sub(1);
         }
@@ -208,37 +260,61 @@ fn handle_client(
             }
         }
 
-        // Cap the frame rate so a fast viewer doesn't make us spin on a static screen.
-        let since = last_frame.elapsed();
-        if since < MIN_FRAME_INTERVAL {
-            std::thread::sleep(MIN_FRAME_INTERVAL - since);
+        // Pace to the frame rate. Once the screen has been still for a moment, wait for the next
+        // change inside the capture call instead (DXGI wakes us the moment one happens).
+        let idle = last_change.elapsed() > IDLE_AFTER;
+        if !idle {
+            let since = last_frame.elapsed();
+            if since < frame_interval {
+                std::thread::sleep(frame_interval - since);
+            }
         }
         last_frame = Instant::now();
+        let wait = if idle { settings.idle_poll } else { Duration::ZERO };
 
         // Re-resolve the target by name each frame. If a requested display has gone away,
         // skip the frame and wait for it to return — never substitute the primary.
-        let frame = match &target_name {
-            Some(name) => match capture::find_display_by_name(name).and_then(|d| capture::capture_display(&d)) {
-                Some(f) => f,
+        let d = match &target_name {
+            Some(name) => match capture::find_display_by_name(name) {
+                Some(d) => d,
                 None => {
                     std::thread::sleep(Duration::from_millis(100));
                     continue;
                 }
             },
-            None => match capture::capture_primary() {
-                Some(f) => f,
-                None => {
-                    std::thread::sleep(Duration::from_millis(50));
-                    continue;
-                }
-            },
+            None => capture::primary_display(),
         };
-        let (payload, encoding, w, h) = if use_h264 {
-            let (bgra, w, h) = h264::even_frame(frame.bgra, frame.w as usize, frame.h as usize);
+        match source.grab(&d, wait, &mut cur) {
+            capture::Grab::New => {
+                stats.captures += 1;
+                stats.capture += source.copy_time;
+            }
+            capture::Grab::Unchanged => {
+                stats.unchanged += 1;
+                continue;
+            }
+            capture::Grab::Failed => {
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+        }
+
+        // Nothing visibly changed (cursor included): don't encode or send anything.
+        if cur == prev {
+            stats.unchanged += 1;
+            continue;
+        }
+        last_change = Instant::now();
+
+        let (w, h) = (d.width as usize, d.height as usize);
+        let t = Instant::now();
+        let (encoding, w, h) = if use_h264 {
+            let (view, w, h) = h264::even_view(&cur, w, h, &mut scratch);
             if encoder.as_ref().map_or(true, |e| e.dimensions() != (w, h)) {
-                match h264::H264Encoder::new(w, h, h264_bitrate(w, h)) {
+                let bitrate = settings.h264_bitrate_for(w, h, req_quality);
+                match h264::H264Encoder::new(w, h, bitrate) {
                     Ok(e) => {
-                        println!("[server] H.264 encoder {w}x{h} @ {} kbps", h264_bitrate(w, h) / 1000);
+                        println!("[server] H.264 encoder {w}x{h} @ {} kbps", bitrate / 1000);
                         encoder = Some(e);
                     }
                     Err(e) => {
@@ -248,65 +324,74 @@ fn handle_client(
                     }
                 }
             }
-            match encoder.as_mut().and_then(|e| e.encode(&bgra)) {
-                Some(au) => (au, Encoding::H264, w as u32, h as u32),
-                None => continue,
+            if !encoder.as_mut().is_some_and(|e| e.encode(view, &mut payload)) {
+                continue;
             }
+            (Encoding::H264, w, h)
         } else {
-            let rgb = capture::bgra_to_rgb(&frame.bgra, frame.w, frame.h);
-            let mut jpeg = Vec::new();
-            if Encoder::new(&mut jpeg, quality)
-                .encode(&rgb, frame.w as u16, frame.h as u16, ColorType::Rgb)
+            payload.clear();
+            if Encoder::new(&mut payload, jpeg_quality)
+                .encode(&cur, w as u16, h as u16, ColorType::Bgra)
                 .is_err()
             {
                 continue;
             }
-            (jpeg, Encoding::Jpeg, frame.w, frame.h)
+            (Encoding::Jpeg, w, h)
         };
+        stats.encode += t.elapsed();
 
-        let msg = build_framebuffer(w, h, &payload, encoding);
+        write_framebuffer(&mut msg, w as u32, h as u32, &payload, encoding);
         if writer.write_all(&msg).is_err() {
             break;
         }
+        std::mem::swap(&mut prev, &mut cur);
         in_flight += 1;
-        frames += 1;
-        bytes += payload.len() as u64;
-        if fps_t.elapsed() >= Duration::from_secs(2) {
-            let secs = fps_t.elapsed().as_secs_f64();
-            let inputs = input_events.swap(0, Ordering::Relaxed);
-            println!(
-                "[server] {:.1} fps ({w}x{h} {}, {} KB/frame, {:.1} Mbps){}",
-                frames as f64 / secs,
-                if use_h264 { "H.264" } else { "JPEG" },
-                bytes / frames.max(1) / 1024,
-                bytes as f64 * 8.0 / secs / 1e6,
-                match (inputs, allow_input) {
-                    (0, _) => String::new(),
-                    (n, true) => format!(", {n} input events"),
-                    (n, false) => format!(", {n} input events IGNORED (no --allow-input)"),
-                }
-            );
-            frames = 0;
-            bytes = 0;
-            fps_t = Instant::now();
-        }
-
-        if last_ping.elapsed() > Duration::from_secs(2) {
-            let _ = writer.write_all(&proto::build_ping());
-            last_ping = Instant::now();
-        }
+        stats.frames += 1;
+        stats.bytes += payload.len() as u64;
+        stats.dims = (w, h);
     }
     println!("[server] client disconnected: {peer:?}");
     Ok(())
 }
 
-/// H.264 bitrate scaled to resolution (~8 bits/pixel/s): 1366x768 ≈ 8 Mbps, 1080p ≈ 16 Mbps.
-fn h264_bitrate(w: usize, h: usize) -> u32 {
-    ((w * h) as u64 * 8).clamp(2_000_000, 20_000_000) as u32
+/// Per-interval streaming statistics for the log.
+#[derive(Default)]
+struct Stats {
+    frames: u64,
+    captures: u64,
+    unchanged: u64,
+    bytes: u64,
+    capture: Duration,
+    encode: Duration,
+    dims: (usize, usize),
 }
 
-/// One full-frame framebuffer message: a whole JPEG image or one H.264 access unit.
-fn build_framebuffer(w: u32, h: u32, payload: &[u8], encoding: Encoding) -> Vec<u8> {
+impl Stats {
+    fn print(&self, elapsed: Duration, h264: bool, inputs: u32, allow_input: bool) {
+        let secs = elapsed.as_secs_f64();
+        println!(
+            "[server] {:.1} fps ({}x{} {}, {} KB/frame, {:.1} Mbps) capture {:.1} ms, encode {:.1} ms, {} unchanged skipped{}",
+            self.frames as f64 / secs,
+            self.dims.0,
+            self.dims.1,
+            if h264 { "H.264" } else { "JPEG" },
+            self.bytes / self.frames.max(1) / 1024,
+            self.bytes as f64 * 8.0 / secs / 1e6,
+            self.capture.as_secs_f64() * 1000.0 / self.captures.max(1) as f64,
+            self.encode.as_secs_f64() * 1000.0 / self.frames.max(1) as f64,
+            self.unchanged,
+            match (inputs, allow_input) {
+                (0, _) => String::new(),
+                (n, true) => format!(", {n} input events"),
+                (n, false) => format!(", {n} input events IGNORED (no --allow-input)"),
+            }
+        );
+    }
+}
+
+/// Build one full-frame framebuffer message (a whole JPEG image or one H.264 access unit)
+/// into `msg`, reusing its allocation.
+fn write_framebuffer(msg: &mut Vec<u8>, w: u32, h: u32, payload: &[u8], encoding: Encoding) {
     let mut hd = Header::new(MsgType::Framebuffer);
     hd.set_u32(4, payload.len() as u32); // payloadLen
     hd.set_u32(8, w); // width
@@ -321,10 +406,9 @@ fn build_framebuffer(w: u32, h: u32, payload: &[u8], encoding: Encoding) -> Vec<
     hd.set_u32(60, 1); // fragment count
     hd.set_u32(64, 0); // fragmentInfo: 0 = whole frame
     hd.set_u32(68, payload.len() as u32); // payloadSize
-    let mut msg = Vec::with_capacity(HEADER_LEN + payload.len());
+    msg.clear();
     msg.extend_from_slice(&hd.bytes);
     msg.extend_from_slice(payload);
-    msg
 }
 
 fn inject_mouse(h: &Header, target: Option<&str>) {
