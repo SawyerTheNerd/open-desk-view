@@ -8,6 +8,7 @@ import android.graphics.Paint
 import android.graphics.Rect
 import android.media.MediaCodec
 import android.media.MediaFormat
+import android.os.Build
 import android.util.Log
 import android.view.Surface
 import android.view.SurfaceHolder
@@ -18,13 +19,15 @@ import java.net.InetSocketAddress
 import java.net.Socket
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 
 /**
  * One spacedesk display session. Runs its own network thread: connects, identifies (extended
  * display at the requested resolution), then either
  *  - decodes JPEG framebuffer bands with BitmapFactory and paints them to the [SurfaceHolder], or
  *  - feeds H.264 Annex-B access units to a hardware MediaCodec that renders straight to the Surface.
- * Input is sent back through [sendTouch].
+ * Input is sent back through [sendTouch], [sendMouse] and [sendKey].
  */
 class SpacedeskClient(
     private val host: String,
@@ -43,8 +46,12 @@ class SpacedeskClient(
     @Volatile private var running = false
     @Volatile private var holder: SurfaceHolder? = null
     @Volatile private var surface: Surface? = null
-    private var socket: Socket? = null
-    private var out: OutputStream? = null
+    @Volatile private var socket: Socket? = null
+    @Volatile private var out: OutputStream? = null
+
+    // Input arrives on the UI thread, where Android forbids network I/O (it throws
+    // NetworkOnMainThreadException), so input is written from this single ordered thread.
+    private val inputSender = Executors.newSingleThreadExecutor()
 
     // JPEG path
     private var full: Bitmap? = null
@@ -79,15 +86,27 @@ class SpacedeskClient(
 
     fun stop() {
         running = false
+        // Say goodbye and close from the input thread (network I/O is not allowed on the UI thread).
         try {
-            out?.let { synchronized(it) { it.write(Protocol.buildDisconnect()); it.flush() } }
-        } catch (_: Exception) {
-        }
-        try {
-            socket?.close()
-        } catch (_: Exception) {
+            inputSender.execute {
+                send(Protocol.buildDisconnect())
+                try {
+                    socket?.close()
+                } catch (_: Exception) {
+                }
+            }
+            inputSender.shutdown()
+        } catch (_: RejectedExecutionException) {
         }
         releaseCodec()
+    }
+
+    /** Queue a message for the input thread; dropped once the client is stopped. */
+    private fun sendAsync(bytes: ByteArray) {
+        try {
+            inputSender.execute { send(bytes) }
+        } catch (_: RejectedExecutionException) {
+        }
     }
 
     private fun send(bytes: ByteArray) {
@@ -103,7 +122,19 @@ class SpacedeskClient(
 
     fun sendTouch(xServer: Int, yServer: Int, flags: Int, ts: Int) {
         if (serverW == 0) return
-        send(Protocol.buildTouch(xServer, yServer, serverW, serverH, flags, ts))
+        sendAsync(Protocol.buildTouch(xServer, yServer, serverW, serverH, flags, ts))
+    }
+
+    /** Mouse event: [x]/[y] are 0..65535 across the frame; [mouseFlags] are Win32 MOUSEEVENTF_* bits. */
+    fun sendMouse(x: Int, y: Int, wheel: Int, mouseFlags: Int) {
+        if (serverW == 0) return
+        sendAsync(Protocol.buildMouse(x, y, wheel, mouseFlags))
+    }
+
+    /** Keyboard event: Windows virtual-key code and Win32 KEYEVENTF_* flags. */
+    fun sendKey(vk: Int, flags: Int) {
+        if (serverW == 0) return
+        sendAsync(Protocol.buildKeyboard(vk, 0, flags))
     }
 
     private fun runLoop() {
@@ -196,7 +227,7 @@ class SpacedeskClient(
 
         fragCounter++
         if (fb.encoding == Protocol.ENC_H264) {
-            // One full access unit per message: ack every frame.
+            // One full access unit per message: ack each one the decoder accepted.
             if (committed) {
                 send(Protocol.buildFlowAck())
                 countFrame()
@@ -220,6 +251,11 @@ class SpacedeskClient(
         val surf = surface ?: return false
         return try {
             val fmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, serverW, serverH)
+            // Keyframes of detailed screen content can be large; make sure one always fits.
+            fmt.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, serverW * serverH * 3 / 2)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                fmt.setInteger(MediaFormat.KEY_LOW_LATENCY, 1) // show frames as soon as decoded
+            }
             val c = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
             c.configure(fmt, surf, null, 0)
             c.start()
@@ -235,34 +271,45 @@ class SpacedeskClient(
         }
     }
 
-    /** Feed one Annex-B access unit; render any ready output frames. Returns true if a frame rendered. */
+    /**
+     * Feed one Annex-B access unit and render whatever frames are ready. Returns true once the
+     * decoder has accepted the unit; that's when we ack, so the server can keep a few frames in
+     * flight while the decoder buffers. A unit is never dropped (that would corrupt every P-frame
+     * after it): if the decoder's input is full we keep draining output until a slot frees up.
+     */
     private fun decodeH264(au: ByteArray): Boolean {
         if (au.isEmpty()) return false
         if (!ensureCodec()) return false
         val c = codec ?: return false
         try {
-            val inIdx = c.dequeueInputBuffer(10_000)
-            if (inIdx >= 0) {
-                val buf = c.getInputBuffer(inIdx)
-                if (buf != null) {
-                    buf.clear()
-                    buf.put(au)
-                    c.queueInputBuffer(inIdx, 0, au.size, ptsUs, 0)
-                    ptsUs += 16_666
-                }
+            var inIdx = c.dequeueInputBuffer(10_000)
+            var waits = 0
+            while (inIdx < 0 && running && waits < 100) { // up to ~1 s
+                drainOutput(c)
+                inIdx = c.dequeueInputBuffer(10_000)
+                waits++
             }
-            var rendered = false
-            val info = MediaCodec.BufferInfo()
-            var outIdx = c.dequeueOutputBuffer(info, 0)
-            while (outIdx >= 0) {
-                c.releaseOutputBuffer(outIdx, true) // render to the Surface
-                rendered = true
-                outIdx = c.dequeueOutputBuffer(info, 0)
-            }
-            return rendered
+            if (inIdx < 0) return false
+            val buf = c.getInputBuffer(inIdx) ?: return false
+            buf.clear()
+            buf.put(au)
+            c.queueInputBuffer(inIdx, 0, au.size, ptsUs, 0)
+            ptsUs += 16_666
+            drainOutput(c)
+            return true
         } catch (e: Exception) {
             Log.e(TAG, "H.264 decode error", e)
             return false
+        }
+    }
+
+    /** Render every decoded frame that's ready to the Surface. */
+    private fun drainOutput(c: MediaCodec) {
+        val info = MediaCodec.BufferInfo()
+        var outIdx = c.dequeueOutputBuffer(info, 0)
+        while (outIdx >= 0) {
+            c.releaseOutputBuffer(outIdx, true)
+            outIdx = c.dequeueOutputBuffer(info, 0)
         }
     }
 

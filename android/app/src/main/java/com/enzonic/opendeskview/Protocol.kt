@@ -40,6 +40,22 @@ object Protocol {
     const val TOUCH_DOWN = 0x02
     const val TOUCH_UP = 0x04
 
+    // Win32 MOUSEEVENTF_* bits carried in mouse messages.
+    const val MOUSE_MOVE = 0x0001
+    const val MOUSE_LEFTDOWN = 0x0002
+    const val MOUSE_LEFTUP = 0x0004
+    const val MOUSE_RIGHTDOWN = 0x0008
+    const val MOUSE_RIGHTUP = 0x0010
+    const val MOUSE_MIDDLEDOWN = 0x0020
+    const val MOUSE_MIDDLEUP = 0x0040
+    const val MOUSE_WHEEL = 0x0800
+    const val MOUSE_HWHEEL = 0x1000
+    const val MOUSE_ABSOLUTE = 0x8000
+
+    // Win32 KEYEVENTF_* bits carried in keyboard messages.
+    const val KEY_EXTENDED = 0x0001
+    const val KEY_UP = 0x0002
+
     private fun header(type: Int): ByteBuffer =
         ByteBuffer.allocate(HEADER_LEN).order(ByteOrder.LITTLE_ENDIAN).apply { putInt(0, type) }
 
@@ -88,6 +104,25 @@ object Protocol {
     fun buildPing(): ByteArray = headerOnly(T_PING)
     fun buildFlowAck(): ByteArray = headerOnly(T_FLOW_ACK)
     fun buildDisconnect(): ByteArray = headerOnly(T_DISCONNECT)
+
+    /** Mouse (type 10), header-only. Absolute [x]/[y] are 0..65535 across the frame. */
+    fun buildMouse(x: Int, y: Int, wheel: Int, mouseFlags: Int): ByteArray {
+        val h = header(T_MOUSE)
+        h.putInt(8, x)
+        h.putInt(12, y)
+        h.putInt(16, wheel)
+        h.putInt(20, mouseFlags)
+        return h.array()
+    }
+
+    /** Keyboard (type 11), header-only: Windows virtual-key code, scan code, KEYEVENTF_* flags. */
+    fun buildKeyboard(vk: Int, scan: Int, flags: Int): ByteArray {
+        val h = header(T_KEYBOARD)
+        h.putInt(8, vk)
+        h.putInt(12, scan)
+        h.putInt(16, flags)
+        return h.array()
+    }
 
     /** Touch (type 12), header-only. Coordinates are in [0, resX] x [0, resY]. */
     fun buildTouch(x: Int, y: Int, resX: Int, resY: Int, flags: Int, ts: Int): ByteArray {
