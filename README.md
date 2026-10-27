@@ -1,4 +1,4 @@
-# OpenDeskView — open-source spacedesk-compatible viewer
+# OpenDeskView — open-source spacedesk-compatible viewer and server
 
 > **Independent project — not affiliated with, endorsed by, or connected to datronicsoft or spacedesk.**
 > "spacedesk" is used only to describe protocol compatibility. See [`NOTICE.md`](NOTICE.md).
@@ -11,9 +11,11 @@ same core runs on Windows, Linux, macOS, and (later) mobile.
 **Native rendering, no OS webview.** Pixels are decoded and drawn directly (`winit` + `softbuffer`); nothing
 is wrapped in a system WebView.
 
-> Status: **milestone 1 working** — LAN discovery, connection, identification handshake, JPEG framebuffer
-> decode + composite, flow control, ping keepalive, and mouse/keyboard input. Verified live against
-> spacedesk Server 2.x on port 28252. H.264 decode is the next milestone.
+It also includes an open-source **Windows server**, so a Chromebook, tablet or phone can be a true
+extended touchscreen monitor with no spacedesk software at all (see [Server](#server-windows--no-spacedesk-needed)).
+
+> Status: viewers (desktop + Android) and server working end to end — extended display via a virtual
+> monitor, H.264, cursor, touch/touchpad/keyboard input. Verified live on a Chromebook at 30+ fps.
 
 ## Layout
 
@@ -44,9 +46,8 @@ Run it (the machine running the spacedesk **Server** must be reachable):
 ./target/release/spacedesk-viewer 192.168.1.103
 ./target/release/spacedesk-viewer 192.168.1.103:28252
 
-# H.264 instead of JPEG (lower bandwidth). Needs Cisco's prebuilt OpenH264 library next to the exe:
-#   download http://ciscobinary.openh264.org/openh264-2.6.0-win64.dll.bz2, decompress to
-#   openh264-2.6.0-win64.dll beside the viewer (or set OPENH264_DLL to its path).
+# H.264 instead of JPEG (lower bandwidth). Needs Cisco's prebuilt OpenH264 library next to the exe
+# (see "OpenH264" below; it is not bundled).
 ./target/release/spacedesk-viewer --h264 192.168.1.103
 
 # headless protocol check (no window): connect, identify, print what the server streams
@@ -94,8 +95,12 @@ untick the box on the start screen to fall back to JPEG if a device's decoder mi
 
 On the Chromebook: enable **Linux/ADB debugging** (Settings → "Develop Android apps") or sideload the APK,
 open **OpenDeskView**, enter the PC's IP (or tap *Discover on LAN*), and Connect. A server must be
-running on the PC — OpenDeskView's own (below) or spacedesk's. Status: display + flow control + ping verified live at ~30 fps on a real device;
-touch plumbing is in place and gets its first live test on a touchscreen.
+running on the PC — OpenDeskView's own (below) or spacedesk's. Touchscreen, touchpad (move, click,
+right-click, scroll) and hardware keyboard are forwarded; verified live on a Chromebook.
+
+The start screen's **Performance** choice trades smoothness for battery and bandwidth: *Battery saver*
+(24 fps, lower quality), *Balanced* (30 fps) or *Smoothest* (60 fps, best quality). The app remembers
+it, the PC's IP and the H.264 setting.
 
 ## Server (Windows) — no spacedesk needed
 
@@ -122,9 +127,43 @@ spacedesk-server --list-displays           # show monitors and which one --virtu
 spacedesk-server                           # mirror the primary display instead
 ```
 
+**Resource usage.** Pick a profile, then fine-tune with flags if you like:
+
+| `--profile` | max fps | H.264 budget | JPEG quality | still-screen check |
+|---|---|---|---|---|
+| `eco` | 24 | 4 bits/pixel/s | 60 | every 250 ms |
+| `balanced` (default) | 30 | 6 bits/pixel/s | 75 | every 100 ms |
+| `performance` | 60 | 10 bits/pixel/s | 85 | every 16 ms |
+
+`--max-fps N`, `--bitrate-kbps N` (fixed H.264 bitrate) and `--quality N` (JPEG) override the profile.
+These are ceilings: each viewer can ask for less (the Android app's *Performance* setting), never more.
+
+The server captures with **DXGI Desktop Duplication**, so the GPU says when something changed: an
+unchanged screen is never re-encoded or re-sent, and capturing a 1080p frame takes ~2.5 ms (GDI, the
+automatic fallback, takes ~35 ms). Measured streaming a 1080p screen with live animation, on one CPU
+core: `eco` ~20%, `balanced` ~31%, `performance` ~54% at ~40 fps. The stats line it prints every two
+seconds shows frame rate, bitrate, capture/encode time and skipped frames.
+
+Viewers that ask for H.264 get it when Cisco's OpenH264 library sits next to the server (see below);
+otherwise, or with `--no-h264`, the server streams JPEG. The Android app decodes H.264 in hardware, so
+it is much smoother than JPEG (about 30+ fps vs 4 on a Chromebook).
+
 Stop spacedesk's own service first if it's installed — both use port 28252. Connections are
 **unauthenticated and unencrypted**: anyone on your LAN can view the streamed display, and with
 `--allow-input` control this PC. Use it only on a network you trust.
+
+## OpenH264 (Windows H.264)
+
+The Windows server and desktop viewer use Cisco's prebuilt OpenH264 library for H.264. Cisco's
+patent license only covers the library when you download it **directly from Cisco**, so it is not
+bundled here. To enable H.264:
+
+1. Download <http://ciscobinary.openh264.org/openh264-2.6.0-win64.dll.bz2>.
+2. Decompress it (e.g. with 7-Zip) to `openh264-2.6.0-win64.dll`.
+3. Put it next to `spacedesk-server.exe` / `spacedesk-viewer.exe`, or set `OPENH264_DLL` to its
+   absolute path. Only Cisco's genuine build is accepted (its hash is checked).
+
+OpenH264 Video Codec provided by Cisco Systems, Inc. — license text in [`NOTICE.md`](NOTICE.md).
 
 ## Roadmap
 
@@ -132,10 +171,11 @@ Stop spacedesk's own service first if it's installed — both use port 28252. Co
 - [x] H.264 (encoding 4) on Android via hardware `MediaCodec` (toggle in the app; default on)
 - [x] H.264 on desktop (Rust) via OpenH264 (`--h264`), loading Cisco's prebuilt library at runtime
 - [x] Open-source Windows server with true extended display (Virtual Display Driver)
-- [ ] Server: PIN/TLS authentication, H.264 encode, real multi-touch injection
-- [ ] Verify + finalize input field semantics against the live server
+- [x] Server H.264 encode; cursor in the stream; touch/touchpad/keyboard input verified on a Chromebook
+- [x] DXGI Desktop Duplication capture, change-only streaming, resource profiles
+- [ ] Server: PIN/TLS authentication, real multi-touch injection
 - [ ] Audio (type 14 speaker session)
-- [ ] Mobile (Android/iOS) front-ends over the same `spacedesk-proto` core
+- [ ] iOS front-end over the same `spacedesk-proto` core
 - [ ] TLS/WSS transport; HTML5-viewer-compatible WebSocket mode
 
 ## Credit & scope

@@ -277,6 +277,7 @@ fn main() {
 
     if use_h264 {
         eprintln!("[net] requesting H.264 (needs openh264-2.6.0-win64.dll next to the viewer).");
+        eprintln!("[net]   OpenH264 Video Codec provided by Cisco Systems, Inc.");
     }
 
     let conn = match net::start(target, id, use_h264, frame.clone(), wake) {
