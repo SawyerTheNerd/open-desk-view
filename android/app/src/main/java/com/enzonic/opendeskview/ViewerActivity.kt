@@ -70,8 +70,11 @@ class ViewerActivity : Activity(), SurfaceHolder.Callback, SpacedeskClient.Liste
             Protocol.ENC_JPEG
         }
 
+        val fps = intent.getIntExtra(EXTRA_FPS, Performance.BALANCED.fps)
+        val quality = intent.getIntExtra(EXTRA_QUALITY, Performance.BALANCED.quality)
+
         client = SpacedeskClient(
-            host, port, reqW, reqH, android.os.Build.MODEL ?: "android", encoding, this
+            host, port, reqW, reqH, android.os.Build.MODEL ?: "android", encoding, fps, quality, this
         )
     }
 
@@ -201,6 +204,8 @@ class ViewerActivity : Activity(), SurfaceHolder.Callback, SpacedeskClient.Liste
         const val EXTRA_HOST = "host"
         const val EXTRA_PORT = "port"
         const val EXTRA_H264 = "h264"
+        const val EXTRA_FPS = "fps"
+        const val EXTRA_QUALITY = "quality"
 
         /** Android button bit -> Win32 down/up flags. */
         private val MOUSE_BUTTONS = listOf(

@@ -36,6 +36,8 @@ class SpacedeskClient(
     private val reqHeight: Int,
     private val deviceName: String,
     private val encoding: Int,
+    private val fps: Int,
+    private val quality: Int,
     private val listener: Listener,
 ) {
     interface Listener {
@@ -150,8 +152,8 @@ class SpacedeskClient(
                 Protocol.buildIdentification(
                     width = reqWidth,
                     height = reqHeight,
-                    quality = 80,
-                    fps = 60,
+                    quality = quality,
+                    fps = fps,
                     encoding = encoding,
                     guid = "{00000000-0000-0000-0000-000000000001}",
                     deviceName = deviceName,
