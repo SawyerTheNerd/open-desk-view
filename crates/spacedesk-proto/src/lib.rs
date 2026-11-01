@@ -223,6 +223,13 @@ pub fn build_disconnect() -> Vec<u8> {
     header_only(MsgType::Disconnect)
 }
 
+/// Mouse `flags` (offset 24): the pointer moved.
+pub const MOUSE_FLAG_MOVE: u32 = 0x01;
+
+/// Keyboard `flags` (offset 16) are Win32 `KEYEVENTF_*` bits.
+pub const KEY_EXTENDED: u32 = 0x0001;
+pub const KEY_UP: u32 = 0x0002;
+
 /// Mouse event (header-only). Deltas are relative unless the caller sets an absolute flag.
 pub fn build_mouse(x: i32, y: i32, wheel: i32, buttons: u32, flags: u32) -> Vec<u8> {
     let mut h = Header::new(MsgType::Mouse);

@@ -1,16 +1,6 @@
 package com.enzonic.opendeskview
 
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
-import android.graphics.Canvas
-import android.graphics.Color
-import android.graphics.Paint
-import android.graphics.Rect
-import android.media.MediaCodec
-import android.media.MediaFormat
-import android.os.Build
 import android.util.Log
-import android.view.Surface
 import android.view.SurfaceHolder
 import java.io.BufferedInputStream
 import java.io.DataInputStream
@@ -21,13 +11,13 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * One spacedesk display session. Runs its own network thread: connects, identifies (extended
- * display at the requested resolution), then either
- *  - decodes JPEG framebuffer bands with BitmapFactory and paints them to the [SurfaceHolder], or
- *  - feeds H.264 Annex-B access units to a hardware MediaCodec that renders straight to the Surface.
- * Input is sent back through [sendTouch], [sendMouse] and [sendKey].
+ * display at the requested resolution), hands each framebuffer to the [VideoSink] for its
+ * encoding and acks the frames it accepts. If an established connection drops, it reconnects
+ * until [stop] is called. Input is sent back through [sendTouch], [sendMouse] and [sendKey].
  */
 class SpacedeskClient(
     private val host: String,
@@ -42,46 +32,42 @@ class SpacedeskClient(
 ) {
     interface Listener {
         fun onConnected(serverWidth: Int, serverHeight: Int)
+
+        /** An established connection dropped; the client is retrying. */
+        fun onReconnecting(reason: String)
+
+        /** The session is over for good (never connected, or the server closed it). */
         fun onDisconnected(reason: String)
     }
 
+    private val started = AtomicBoolean(false)
     @Volatile private var running = false
-    @Volatile private var holder: SurfaceHolder? = null
-    @Volatile private var surface: Surface? = null
     @Volatile private var socket: Socket? = null
     @Volatile private var out: OutputStream? = null
+    @Volatile private var serverW = 0
+    @Volatile private var serverH = 0
+    private var frameCount = 0
+
+    // The sink is created by the network thread and handed surfaces by the UI thread.
+    private val sinkLock = Any()
+    private var holder: SurfaceHolder? = null // guarded by sinkLock
+    private var sink: VideoSink? = null // guarded by sinkLock
+    private var sinkIsH264 = false // guarded by sinkLock
 
     // Input arrives on the UI thread, where Android forbids network I/O (it throws
     // NetworkOnMainThreadException), so input is written from this single ordered thread.
     private val inputSender = Executors.newSingleThreadExecutor()
 
-    // JPEG path
-    private var full: Bitmap? = null
-    private val frameLock = Any()
-    private val paint = Paint().apply { isFilterBitmap = true }
-    private val clearPaint = Paint().apply { color = Color.rgb(16, 16, 20) }
-
-    // H.264 path
-    private var codec: MediaCodec? = null
-    private var ptsUs = 0L
-
-    private var serverW = 0
-    private var serverH = 0
-    private var fragCounter = 0
-    private var frameCount = 0
-
-    private val isH264 get() = encoding == Protocol.ENC_H264
-
-    fun setSurface(h: SurfaceHolder?) {
+    fun setSurface(h: SurfaceHolder?) = synchronized(sinkLock) {
         holder = h
-        surface = h?.surface
-        if (h == null && isH264) releaseCodec()
-        if (h != null && !isH264) repaint()
+        sink?.setSurface(h)
     }
 
     fun serverSize(): Pair<Int, Int> = serverW to serverH
 
+    /** Start the network thread. Later calls do nothing. */
     fun start() {
+        if (!started.compareAndSet(false, true)) return
         running = true
         Thread({ runLoop() }, "opendeskview-net").start()
     }
@@ -92,15 +78,12 @@ class SpacedeskClient(
         try {
             inputSender.execute {
                 send(Protocol.buildDisconnect())
-                try {
-                    socket?.close()
-                } catch (_: Exception) {
-                }
+                closeSocket()
             }
             inputSender.shutdown()
         } catch (_: RejectedExecutionException) {
         }
-        releaseCodec()
+        releaseSink()
     }
 
     /** Queue a message for the input thread; dropped once the client is stopped. */
@@ -139,225 +122,153 @@ class SpacedeskClient(
         sendAsync(Protocol.buildKeyboard(vk, 0, flags))
     }
 
+    /**
+     * Run sessions until stopped. Once one has reached the server's screen, any later drop is
+     * retried; a first connection that fails, or a [SessionEnded], ends the client for good.
+     */
     private fun runLoop() {
-        try {
-            val s = Socket()
-            s.connect(InetSocketAddress(host, port), 5000)
-            s.tcpNoDelay = true
-            socket = s
-            out = s.getOutputStream()
-            val input = DataInputStream(BufferedInputStream(s.getInputStream(), 1 shl 16))
-
-            send(
-                Protocol.buildIdentification(
-                    width = reqWidth,
-                    height = reqHeight,
-                    quality = quality,
-                    fps = fps,
-                    encoding = encoding,
-                    guid = "{00000000-0000-0000-0000-000000000001}",
-                    deviceName = deviceName,
-                )
-            )
-
-            val hbuf = ByteArray(Protocol.HEADER_LEN)
-            while (running) {
-                input.readFully(hbuf)
-                val h = ByteBuffer.wrap(hbuf).order(ByteOrder.LITTLE_ENDIAN)
-                val type = h.getInt(0)
-                val plen = h.getInt(4)
-                if (plen < 0 || plen > MAX_PAYLOAD) {
-                    throw IllegalStateException("server declared payload $plen (cap $MAX_PAYLOAD)")
-                }
-                val payload = if (plen > 0) ByteArray(plen).also { input.readFully(it) } else EMPTY
-
-                when (type) {
-                    Protocol.T_FRAMEBUFFER -> handleFramebuffer(h, payload)
-                    Protocol.T_PING -> send(Protocol.buildPing())
-                    Protocol.T_DISCONNECT -> {
-                        running = false
-                        listener.onDisconnected("server closed the session")
-                    }
-                    else -> { /* visibility / rotation / settings / cursor: ignored */ }
-                }
+        var reconnect = false
+        var retryMs = RETRY_MIN_MS
+        while (running) {
+            var final = false
+            val reason = try {
+                runSession()
+                "stopped"
+            } catch (e: SessionEnded) {
+                final = true
+                e.message ?: "session ended"
+            } catch (e: Exception) {
+                if (running) Log.w(TAG, "session ended", e)
+                e.message ?: e.javaClass.simpleName
             }
-            listener.onDisconnected("stopped")
-        } catch (e: Exception) {
-            if (running) {
-                Log.e(TAG, "connection error", e)
-                listener.onDisconnected(e.message ?: "connection error")
+            val reachedServer = serverW > 0
+            endSession()
+            if (!running) break
+            if (reachedServer) {
+                reconnect = true
+                retryMs = RETRY_MIN_MS
             }
-        } finally {
-            running = false
+            if (final || !reconnect) {
+                running = false
+                listener.onDisconnected(reason)
+                break
+            }
+            listener.onReconnecting(reason)
             try {
-                socket?.close()
-            } catch (_: Exception) {
+                Thread.sleep(retryMs)
+            } catch (_: InterruptedException) {
+                break
             }
-            releaseCodec()
+            retryMs = (retryMs * 2).coerceAtMost(RETRY_MAX_MS)
         }
     }
 
-    private fun handleFramebuffer(h: ByteBuffer, payload: ByteArray) {
-        val fb = Protocol.Framebuffer(h)
-        if (fb.width <= 0 || fb.height <= 0 || fb.width > MAX_DIM || fb.height > MAX_DIM) return
+    /** One connection: returns once stopped, throws when it fails or the server ends it. */
+    private fun runSession() {
+        val s = Socket()
+        socket = s
+        s.connect(InetSocketAddress(host, port), CONNECT_TIMEOUT_MS)
+        if (!running) return
+        s.tcpNoDelay = true
+        // The server pings regularly, so silence this long means the link is dead.
+        s.soTimeout = READ_TIMEOUT_MS
+        out = s.getOutputStream()
+        val input = DataInputStream(BufferedInputStream(s.getInputStream(), 1 shl 16))
 
-        val isNew = serverW != fb.width || serverH != fb.height
-        if (isNew) {
+        send(
+            Protocol.buildIdentification(
+                width = reqWidth,
+                height = reqHeight,
+                quality = quality,
+                fps = fps,
+                encoding = encoding,
+                guid = "{00000000-0000-0000-0000-000000000001}",
+                deviceName = deviceName,
+            )
+        )
+
+        val hbuf = ByteArray(Protocol.HEADER_LEN)
+        while (running) {
+            input.readFully(hbuf)
+            val h = ByteBuffer.wrap(hbuf).order(ByteOrder.LITTLE_ENDIAN)
+            val type = h.getInt(0)
+            val plen = h.getInt(4)
+            if (plen < 0 || plen > MAX_PAYLOAD) {
+                throw IllegalStateException("server declared payload $plen (cap $MAX_PAYLOAD)")
+            }
+            val payload = if (plen > 0) ByteArray(plen).also { input.readFully(it) } else EMPTY
+
+            when (type) {
+                Protocol.T_FRAMEBUFFER -> handleFramebuffer(Protocol.Framebuffer(h), payload)
+                Protocol.T_PING -> send(Protocol.buildPing())
+                Protocol.T_DISCONNECT -> throw SessionEnded("server closed the session")
+                else -> { /* visibility / rotation / settings / cursor: ignored */ }
+            }
+        }
+    }
+
+    /** Forget everything about the last connection, so the next one starts clean. */
+    private fun endSession() {
+        closeSocket()
+        out = null
+        serverW = 0
+        serverH = 0
+        frameCount = 0
+        releaseSink()
+    }
+
+    private fun closeSocket() {
+        try {
+            socket?.close()
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun handleFramebuffer(fb: Protocol.Framebuffer, payload: ByteArray) {
+        if (fb.width <= 0 || fb.height <= 0 || fb.width > MAX_DIM || fb.height > MAX_DIM) return
+        if (serverW != fb.width || serverH != fb.height) {
             serverW = fb.width
             serverH = fb.height
             Log.i(TAG, "connected: server ${serverW}x$serverH enc=${fb.encoding}")
             listener.onConnected(serverW, serverH)
         }
-
-        var committed = false
-        if (fb.encoding == Protocol.ENC_H264) {
-            committed = decodeH264(payload)
-        } else if (fb.encoding == Protocol.ENC_JPEG && payload.isNotEmpty()) {
-            if (full == null || isNew) {
-                synchronized(frameLock) {
-                    full = Bitmap.createBitmap(serverW, serverH, Bitmap.Config.ARGB_8888)
-                }
-            }
-            val tile = BitmapFactory.decodeByteArray(payload, 0, payload.size)
-            if (tile != null) {
-                synchronized(frameLock) {
-                    full?.let { Canvas(it).drawBitmap(tile, fb.rectLeft.toFloat(), fb.rectTop.toFloat(), null) }
-                }
-                tile.recycle()
-            }
-        }
-
-        fragCounter++
-        if (fb.encoding == Protocol.ENC_H264) {
-            // One full access unit per message: ack each one the decoder accepted.
-            if (committed) {
-                send(Protocol.buildFlowAck())
-                countFrame()
-            }
-        } else if (fb.fragmentInfo == 0 || fragCounter % 4 == 0) {
+        if (sinkFor(fb.encoding).submit(fb, payload)) {
             send(Protocol.buildFlowAck())
-            repaint()
-            countFrame()
+            frameCount++
+            if (frameCount % 300 == 0) Log.i(TAG, "rendered $frameCount frames")
         }
     }
 
-    private fun countFrame() {
-        frameCount++
-        if (frameCount % 30 == 0) Log.i(TAG, "rendered $frameCount frames")
-    }
-
-    // --- H.264 (MediaCodec, hardware, renders straight to the Surface) ---
-
-    private fun ensureCodec(): Boolean {
-        if (codec != null) return true
-        val surf = surface ?: return false
-        return try {
-            val fmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, serverW, serverH)
-            // Keyframes of detailed screen content can be large; make sure one always fits.
-            fmt.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, serverW * serverH * 3 / 2)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                fmt.setInteger(MediaFormat.KEY_LOW_LATENCY, 1) // show frames as soon as decoded
-            }
-            val c = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-            c.configure(fmt, surf, null, 0)
-            c.start()
-            codec = c
-            ptsUs = 0
-            Log.i(TAG, "MediaCodec AVC started ${serverW}x$serverH")
-            true
-        } catch (e: Exception) {
-            Log.e(TAG, "MediaCodec init failed", e)
-            listener.onDisconnected("H.264 decoder unavailable: ${e.message}")
-            running = false
-            false
+    /** The sink for [enc], replacing the current one if the server switched encodings. */
+    private fun sinkFor(enc: Int): VideoSink = synchronized(sinkLock) {
+        val h264 = enc == Protocol.ENC_H264
+        sink?.takeIf { sinkIsH264 == h264 } ?: run {
+            sink?.release()
+            val s: VideoSink = if (h264) H264Sink() else JpegSink()
+            s.setSurface(holder)
+            sink = s
+            sinkIsH264 = h264
+            s
         }
     }
 
-    /**
-     * Feed one Annex-B access unit and render whatever frames are ready. Returns true once the
-     * decoder has accepted the unit; that's when we ack, so the server can keep a few frames in
-     * flight while the decoder buffers. A unit is never dropped (that would corrupt every P-frame
-     * after it): if the decoder's input is full we keep draining output until a slot frees up.
-     */
-    private fun decodeH264(au: ByteArray): Boolean {
-        if (au.isEmpty()) return false
-        if (!ensureCodec()) return false
-        val c = codec ?: return false
-        try {
-            var inIdx = c.dequeueInputBuffer(10_000)
-            var waits = 0
-            while (inIdx < 0 && running && waits < 100) { // up to ~1 s
-                drainOutput(c)
-                inIdx = c.dequeueInputBuffer(10_000)
-                waits++
-            }
-            if (inIdx < 0) return false
-            val buf = c.getInputBuffer(inIdx) ?: return false
-            buf.clear()
-            buf.put(au)
-            c.queueInputBuffer(inIdx, 0, au.size, ptsUs, 0)
-            ptsUs += 16_666
-            drainOutput(c)
-            return true
-        } catch (e: Exception) {
-            Log.e(TAG, "H.264 decode error", e)
-            return false
-        }
-    }
-
-    /** Render every decoded frame that's ready to the Surface. */
-    private fun drainOutput(c: MediaCodec) {
-        val info = MediaCodec.BufferInfo()
-        var outIdx = c.dequeueOutputBuffer(info, 0)
-        while (outIdx >= 0) {
-            c.releaseOutputBuffer(outIdx, true)
-            outIdx = c.dequeueOutputBuffer(info, 0)
-        }
-    }
-
-    private fun releaseCodec() {
-        val c = codec ?: return
-        codec = null
-        try {
-            c.stop()
-        } catch (_: Exception) {
-        }
-        try {
-            c.release()
-        } catch (_: Exception) {
-        }
-    }
-
-    // --- JPEG (Canvas blit) ---
-
-    private fun repaint() {
-        val hdr = holder ?: return
-        val canvas = try {
-            hdr.lockCanvas()
-        } catch (_: Exception) {
-            null
-        } ?: return
-        try {
-            synchronized(frameLock) {
-                val bmp = full
-                if (bmp == null) {
-                    canvas.drawRect(0f, 0f, canvas.width.toFloat(), canvas.height.toFloat(), clearPaint)
-                } else {
-                    canvas.drawBitmap(bmp, null, Rect(0, 0, canvas.width, canvas.height), paint)
-                }
-            }
-        } finally {
-            try {
-                hdr.unlockCanvasAndPost(canvas)
-            } catch (_: Exception) {
-            }
-        }
+    private fun releaseSink() = synchronized(sinkLock) {
+        sink?.release()
+        sink = null
     }
 
     companion object {
         private const val TAG = "opendeskview"
         private const val MAX_PAYLOAD = 64 * 1024 * 1024
         private const val MAX_DIM = 16384
+        private const val CONNECT_TIMEOUT_MS = 5000
+        // Servers ping at least every ~10 s (spacedesk) or 2-4 s (ours).
+        private const val READ_TIMEOUT_MS = 30_000
+        private const val RETRY_MIN_MS = 1000L
+        private const val RETRY_MAX_MS = 8000L
         private val EMPTY = ByteArray(0)
     }
 }
+
+/** The session ended in a way reconnecting won't fix. */
+class SessionEnded(reason: String) : Exception(reason)

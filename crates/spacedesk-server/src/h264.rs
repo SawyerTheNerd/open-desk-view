@@ -35,8 +35,8 @@ pub struct H264Encoder {
 }
 
 impl H264Encoder {
-    /// `w`/`h` must be even (YUV 4:2:0).
-    pub fn new(w: usize, h: usize, bitrate_bps: u32) -> Result<Self, String> {
+    /// `w`/`h` must be even (YUV 4:2:0). `fps` is the frame-rate ceiling the bitrate is spread over.
+    pub fn new(w: usize, h: usize, bitrate_bps: u32, fps: u32) -> Result<Self, String> {
         let lib = find_lib().ok_or_else(|| {
             format!(
                 "{DLL_NAME} not found — put it next to the server, set OPENH264_DLL, or download \
@@ -48,7 +48,7 @@ impl H264Encoder {
             .usage_type(UsageType::ScreenContentRealTime)
             .rate_control_mode(RateControlMode::Bitrate)
             .bitrate(BitRate::from_bps(bitrate_bps))
-            .max_frame_rate(FrameRate::from_hz(60.0))
+            .max_frame_rate(FrameRate::from_hz(fps as f32))
             // Not supported for screen content; OpenH264 turns them off anyway (and warns).
             .adaptive_quantization(false)
             .background_detection(false)
@@ -62,6 +62,11 @@ impl H264Encoder {
 
     pub fn dimensions(&self) -> (usize, usize) {
         (self.w, self.h)
+    }
+
+    /// Make the next frame an IDR (with SPS/PPS), which a viewer can start decoding from.
+    pub fn force_keyframe(&mut self) {
+        self.enc.force_intra_frame();
     }
 
     /// Encode one top-down BGRA frame of exactly `dimensions()` into `out` as one Annex-B access

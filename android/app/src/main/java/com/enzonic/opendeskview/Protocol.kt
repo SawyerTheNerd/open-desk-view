@@ -112,6 +112,7 @@ object Protocol {
         h.putInt(12, y)
         h.putInt(16, wheel)
         h.putInt(20, mouseFlags)
+        h.putInt(24, if (mouseFlags and MOUSE_MOVE != 0) 0x01 else 0) // spacedesk's own "move" flag
         return h.array()
     }
 

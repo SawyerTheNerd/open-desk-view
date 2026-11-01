@@ -57,11 +57,19 @@ object Keys {
         put(KeyEvent.KEYCODE_NUMPAD_DOT, 0x6E)
     }
 
-    // Keys Windows expects with KEYEVENTF_EXTENDEDKEY (navigation cluster, right-hand modifiers).
-    private val extended = setOf(0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x2D, 0x2E, 0x5B, 0x5C, 0xA3, 0xA5, 0x6F)
+    // Keys Windows expects with KEYEVENTF_EXTENDEDKEY (navigation cluster, right-hand modifiers,
+    // keypad Enter and /). Keyed by Android code: keypad Enter shares Enter's virtual-key code.
+    private val extended = setOf(
+        KeyEvent.KEYCODE_PAGE_UP, KeyEvent.KEYCODE_PAGE_DOWN, KeyEvent.KEYCODE_MOVE_END,
+        KeyEvent.KEYCODE_MOVE_HOME, KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_UP,
+        KeyEvent.KEYCODE_DPAD_RIGHT, KeyEvent.KEYCODE_DPAD_DOWN, KeyEvent.KEYCODE_INSERT,
+        KeyEvent.KEYCODE_FORWARD_DEL, KeyEvent.KEYCODE_META_LEFT, KeyEvent.KEYCODE_META_RIGHT,
+        KeyEvent.KEYCODE_CTRL_RIGHT, KeyEvent.KEYCODE_ALT_RIGHT, KeyEvent.KEYCODE_NUMPAD_DIVIDE,
+        KeyEvent.KEYCODE_NUMPAD_ENTER,
+    )
 
     /** Windows virtual-key code for [keyCode], or null if we don't forward that key. */
     fun toVk(keyCode: Int): Int? = map[keyCode]
 
-    fun isExtended(vk: Int): Boolean = vk in extended
+    fun isExtended(keyCode: Int): Boolean = keyCode in extended
 }

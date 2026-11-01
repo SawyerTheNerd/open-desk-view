@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener, TcpStream, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{channel, RecvTimeoutError};
 use std::sync::Arc;
@@ -15,12 +15,15 @@ use jpeg_encoder::{ColorType, Encoder};
 use proto::{Encoding, Header, MsgType, HEADER_LEN};
 use spacedesk_proto as proto;
 
+use crate::flow::{FlowControl, H264_WINDOW, JPEG_WINDOW};
 use crate::settings::Settings;
 use crate::{capture, display, h264, inject};
 
 const PORT: u16 = proto::DEFAULT_PORT;
-/// Unacknowledged H.264 frames allowed in flight (covers the viewer decoder's buffering).
-const H264_WINDOW: u32 = 3;
+/// A dead peer whose TCP window never opens again must not block the sender forever.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Largest payload accepted from a viewer (an identification is 334 bytes; input has none).
+const MAX_CLIENT_PAYLOAD: usize = 64 * 1024;
 /// After this long without a screen change, poll at the slower `Settings::idle_poll` rate.
 const IDLE_AFTER: Duration = Duration::from_secs(1);
 const STATS_EVERY: Duration = Duration::from_secs(2);
@@ -114,6 +117,7 @@ fn handle_client(
     let peer = stream.peer_addr().ok();
     println!("[server] client connected: {peer:?} (input {})", if allow_input { "ENABLED" } else { "off" });
     stream.set_nodelay(true).ok();
+    stream.set_write_timeout(Some(WRITE_TIMEOUT)).ok();
     let mut reader = stream.try_clone()?;
     let mut writer = stream;
 
@@ -121,11 +125,10 @@ fn handle_client(
     let mut hbuf = [0u8; HEADER_LEN];
     reader.read_exact(&mut hbuf)?;
     let h = Header::from_bytes(&hbuf).unwrap();
-    let plen = h.payload_len();
-    if plen > 0 && plen < (1 << 20) {
-        let mut p = vec![0u8; plen];
-        reader.read_exact(&mut p)?;
+    if h.msg_type() != MsgType::Identification {
+        return Err(std::io::Error::other("first message was not an identification"));
     }
+    skip_payload(&mut reader, h.payload_len())?;
     let (req_w, req_h) = if h.get_u32(48) >= 1 { (h.get_u32(52), h.get_u32(88)) } else { (0, 0) };
     // Requested encoding lives at offset 36 when the extended-identification flag (byte 38) is set.
     let req_enc = if h.bytes[38] & 0x01 != 0 { u16::from_le_bytes([h.bytes[36], h.bytes[37]]) as u32 } else { 0 };
@@ -185,12 +188,8 @@ fn handle_client(
                 break;
             }
             let hh = Header::from_bytes(&hb).unwrap();
-            let plen = hh.payload_len();
-            if plen > 0 {
-                let mut p = vec![0u8; plen.min(1 << 20)];
-                if reader.read_exact(&mut p).is_err() {
-                    break;
-                }
+            if skip_payload(&mut reader, hh.payload_len()).is_err() {
+                break;
             }
             let ty = hh.msg_type();
             if matches!(ty, MsgType::Mouse | MsgType::Keyboard | MsgType::Touch) {
@@ -223,7 +222,7 @@ fn handle_client(
     let mut last_ping = Instant::now();
     let mut last_frame = Instant::now() - frame_interval;
     let mut last_change = Instant::now();
-    let mut in_flight: u32 = 0;
+    let mut flow = FlowControl::new(if use_h264 { H264_WINDOW } else { JPEG_WINDOW });
     let mut stats = Stats::default();
     let mut stats_t = Instant::now();
     loop {
@@ -239,26 +238,18 @@ fn handle_client(
             last_ping = Instant::now();
         }
 
-        while ack_rx.try_recv().is_ok() {
-            in_flight = in_flight.saturating_sub(1);
-        }
-        // H.264 decoders hold a frame or two, so keep a few in flight; JPEG viewers ack each
-        // frame as soon as it's painted.
-        let window = if use_h264 { H264_WINDOW } else { 1 };
-        if in_flight >= window {
-            match ack_rx.recv_timeout(Duration::from_secs(2)) {
-                Ok(()) => in_flight -= 1,
+        ack_rx.try_iter().for_each(|()| flow.on_ack());
+        if !flow.can_send() {
+            match ack_rx.recv_timeout(flow.stall_timeout()) {
+                Ok(()) => flow.on_ack(),
                 Err(RecvTimeoutError::Disconnected) => break, // reader thread ended: client gone
                 Err(RecvTimeoutError::Timeout) => {
-                    // No ack for 2s: check liveness, then let one frame through so a stalled
-                    // viewer pipeline can drain instead of deadlocking.
-                    if writer.write_all(&proto::build_ping()).is_err() {
-                        break;
-                    }
-                    in_flight -= 1;
+                    flow.on_stall();
+                    stats.stalls += 1;
                 }
             }
         }
+        let refresh = flow.needs_refresh();
 
         // Pace to the frame rate. Once the screen has been still for a moment, wait for the next
         // change inside the capture call instead (DXGI wakes us the moment one happens).
@@ -270,7 +261,8 @@ fn handle_client(
             }
         }
         last_frame = Instant::now();
-        let wait = if idle { settings.idle_poll } else { Duration::ZERO };
+        // A pending refresh goes out now, changed or not.
+        let wait = if idle && !refresh { settings.idle_poll } else { Duration::ZERO };
 
         // Re-resolve the target by name each frame. If a requested display has gone away,
         // skip the frame and wait for it to return — never substitute the primary.
@@ -284,35 +276,40 @@ fn handle_client(
             },
             None => capture::primary_display(),
         };
-        match source.grab(&d, wait, &mut cur) {
+        let grabbed = match source.grab(&d, wait, &mut cur) {
             capture::Grab::New => {
                 stats.captures += 1;
                 stats.capture += source.copy_time;
+                true
             }
-            capture::Grab::Unchanged => {
-                stats.unchanged += 1;
-                continue;
-            }
+            capture::Grab::Unchanged => false,
             capture::Grab::Failed => {
                 std::thread::sleep(Duration::from_millis(50));
                 continue;
             }
-        }
+        };
 
-        // Nothing visibly changed (cursor included): don't encode or send anything.
-        if cur == prev {
+        // Nothing visibly changed (cursor included): don't encode or send anything, unless the
+        // viewer needs the current screen again.
+        let changed = grabbed && cur != prev;
+        if changed {
+            last_change = Instant::now();
+        } else if !refresh {
             stats.unchanged += 1;
             continue;
         }
-        last_change = Instant::now();
-
         let (w, h) = (d.width as usize, d.height as usize);
+        let image = if changed { &cur } else { &prev };
+        if image.len() != w * h * 4 {
+            continue; // nothing sent yet at this size; the next capture will be new anyway
+        }
+
         let t = Instant::now();
         let (encoding, w, h) = if use_h264 {
-            let (view, w, h) = h264::even_view(&cur, w, h, &mut scratch);
+            let (view, w, h) = h264::even_view(image, w, h, &mut scratch);
             if encoder.as_ref().map_or(true, |e| e.dimensions() != (w, h)) {
                 let bitrate = settings.h264_bitrate_for(w, h, req_quality);
-                match h264::H264Encoder::new(w, h, bitrate) {
+                match h264::H264Encoder::new(w, h, bitrate, fps) {
                     Ok(e) => {
                         println!("[server] H.264 encoder {w}x{h} @ {} kbps", bitrate / 1000);
                         encoder = Some(e);
@@ -320,18 +317,23 @@ fn handle_client(
                     Err(e) => {
                         eprintln!("[server] H.264 unavailable ({e}); falling back to JPEG");
                         use_h264 = false;
+                        flow.set_window(JPEG_WINDOW);
                         continue;
                     }
                 }
             }
-            if !encoder.as_mut().is_some_and(|e| e.encode(view, &mut payload)) {
+            let Some(enc) = encoder.as_mut() else { continue };
+            if refresh {
+                enc.force_keyframe();
+            }
+            if !enc.encode(view, &mut payload) {
                 continue;
             }
             (Encoding::H264, w, h)
         } else {
             payload.clear();
             if Encoder::new(&mut payload, jpeg_quality)
-                .encode(&cur, w as u16, h as u16, ColorType::Bgra)
+                .encode(image, w as u16, h as u16, ColorType::Bgra)
                 .is_err()
             {
                 continue;
@@ -344,13 +346,30 @@ fn handle_client(
         if writer.write_all(&msg).is_err() {
             break;
         }
-        std::mem::swap(&mut prev, &mut cur);
-        in_flight += 1;
+        if changed {
+            std::mem::swap(&mut prev, &mut cur);
+        }
+        flow.on_sent();
         stats.frames += 1;
         stats.bytes += payload.len() as u64;
         stats.dims = (w, h);
     }
+    // Also unblocks the reader thread, which would otherwise wait on a silent peer forever.
+    let _ = writer.shutdown(Shutdown::Both);
     println!("[server] client disconnected: {peer:?}");
+    Ok(())
+}
+
+/// Read and discard a message payload; refuse sizes no legitimate viewer sends, since the
+/// stream can't be resynchronised after a payload it didn't read.
+fn skip_payload(reader: &mut impl Read, len: usize) -> std::io::Result<()> {
+    if len > MAX_CLIENT_PAYLOAD {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("viewer declared a {len}-byte payload"),
+        ));
+    }
+    std::io::copy(&mut reader.take(len as u64), &mut std::io::sink())?;
     Ok(())
 }
 
@@ -360,6 +379,8 @@ struct Stats {
     frames: u64,
     captures: u64,
     unchanged: u64,
+    /// Times the viewer stopped acking and was restarted from a keyframe.
+    stalls: u64,
     bytes: u64,
     capture: Duration,
     encode: Duration,
@@ -370,7 +391,7 @@ impl Stats {
     fn print(&self, elapsed: Duration, h264: bool, inputs: u32, allow_input: bool) {
         let secs = elapsed.as_secs_f64();
         println!(
-            "[server] {:.1} fps ({}x{} {}, {} KB/frame, {:.1} Mbps) capture {:.1} ms, encode {:.1} ms, {} unchanged skipped{}",
+            "[server] {:.1} fps ({}x{} {}, {} KB/frame, {:.1} Mbps) capture {:.1} ms, encode {:.1} ms, {} unchanged skipped{}{}",
             self.frames as f64 / secs,
             self.dims.0,
             self.dims.1,
@@ -380,6 +401,10 @@ impl Stats {
             self.capture.as_secs_f64() * 1000.0 / self.captures.max(1) as f64,
             self.encode.as_secs_f64() * 1000.0 / self.frames.max(1) as f64,
             self.unchanged,
+            match self.stalls {
+                0 => String::new(),
+                n => format!(", viewer stalled {n}x (resent keyframe)"),
+            },
             match (inputs, allow_input) {
                 (0, _) => String::new(),
                 (n, true) => format!(", {n} input events"),

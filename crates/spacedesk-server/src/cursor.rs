@@ -131,7 +131,7 @@ unsafe fn bits32(bmp: HBITMAP, w: usize, h: usize) -> Option<Vec<u32>> {
     bi.bmiHeader.biHeight = -(h as i32);
     bi.bmiHeader.biPlanes = 1;
     bi.bmiHeader.biBitCount = 32;
-    bi.bmiHeader.biCompression = BI_RGB.0 as u32;
+    bi.bmiHeader.biCompression = BI_RGB.0;
     let mut px = vec![0u32; w * h];
     let dc = GetDC(None);
     let got = GetDIBits(dc, bmp, 0, h as u32, Some(px.as_mut_ptr() as *mut c_void), &mut bi, DIB_RGB_COLORS);

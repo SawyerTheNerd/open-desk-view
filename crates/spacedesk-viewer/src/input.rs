@@ -19,11 +19,6 @@ const MOUSEEVENTF_MIDDLEUP: u32 = 0x0040;
 const MOUSEEVENTF_WHEEL: u32 = 0x0800;
 const MOUSEEVENTF_ABSOLUTE: u32 = 0x8000;
 
-// Win32 KEYEVENTF_*
-const KEYEVENTF_KEYUP: u32 = 0x0002;
-
-const MOUSE_FLAG_MOVE: u32 = 0x01;
-
 #[derive(Clone, Copy)]
 pub enum Btn {
     Left,
@@ -54,7 +49,7 @@ pub fn mouse_move_absolute(
         y,
         0,
         MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
-        MOUSE_FLAG_MOVE,
+        proto::MOUSE_FLAG_MOVE,
     ))
 }
 
@@ -110,14 +105,32 @@ fn vk(code: KeyCode) -> Option<u32> {
         CapsLock => 0x14,
         F1 => 0x70, F2 => 0x71, F3 => 0x72, F4 => 0x73, F5 => 0x74, F6 => 0x75,
         F7 => 0x76, F8 => 0x77, F9 => 0x78, F10 => 0x79, F11 => 0x7A, F12 => 0x7B,
+        Numpad0 => 0x60, Numpad1 => 0x61, Numpad2 => 0x62, Numpad3 => 0x63, Numpad4 => 0x64,
+        Numpad5 => 0x65, Numpad6 => 0x66, Numpad7 => 0x67, Numpad8 => 0x68, Numpad9 => 0x69,
+        NumpadMultiply => 0x6A, NumpadAdd => 0x6B, NumpadSubtract => 0x6D,
+        NumpadDecimal => 0x6E, NumpadDivide => 0x6F, NumpadEnter => 0x0D,
         _ => return None,
     };
     Some(v)
 }
 
+/// Keys Windows expects with KEYEVENTF_EXTENDEDKEY (navigation cluster, right-hand modifiers,
+/// keypad Enter and /). Keep in step with `Keys.kt` in the Android app.
+fn is_extended(code: KeyCode) -> bool {
+    use KeyCode::*;
+    matches!(
+        code,
+        ArrowLeft | ArrowUp | ArrowRight | ArrowDown | Home | End | PageUp | PageDown | Insert
+            | Delete | ControlRight | AltRight | SuperLeft | SuperRight | NumpadEnter | NumpadDivide
+    )
+}
+
 pub fn keyboard(code: KeyCode, down: bool) -> Option<Vec<u8>> {
     let vkey = vk(code)?;
-    let flags = if down { 0 } else { KEYEVENTF_KEYUP };
+    let mut flags = if down { 0 } else { proto::KEY_UP };
+    if is_extended(code) {
+        flags |= proto::KEY_EXTENDED;
+    }
     // scancode left 0 for now; the server injects by VK when scancode is absent (needs verification).
     Some(proto::build_keyboard(vkey, 0, flags))
 }

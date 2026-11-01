@@ -30,8 +30,8 @@
 
         <activity
             android:name=".ViewerActivity"
-            android:configChanges="orientation|screenSize|keyboardHidden|keyboard|screenLayout"
-            android:exported="true"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|density|keyboardHidden|keyboard|navigation|uiMode"
+            android:exported="false"
             android:screenOrientation="fullSensor"
             android:theme="@android:style/Theme.Material.NoActionBar.Fullscreen" />
     </application>

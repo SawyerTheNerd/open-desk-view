@@ -1,7 +1,8 @@
 //! Open-source spacedesk viewer — native cross-platform (no OS webview).
 //!
 //! Usage:
-//!   spacedesk-viewer                 # discover servers on the LAN, connect to the first
+//!   spacedesk-viewer                 # discover servers on the LAN and list them
+//!   spacedesk-viewer --connect-first # ...and connect to the first one
 //!   spacedesk-viewer 192.168.1.103   # connect directly (default port 28252)
 //!   spacedesk-viewer 192.168.1.103:28252
 
@@ -24,12 +25,8 @@ use winit::keyboard::PhysicalKey;
 use winit::window::{Window, WindowId};
 
 use frame::{Frame, SharedFrame};
+use net::NetEvent;
 use spacedesk_proto::{self as proto, Encoding, Identification};
-
-#[derive(Debug, Clone, Copy)]
-enum UserEvent {
-    FrameReady,
-}
 
 struct App {
     frame: SharedFrame,
@@ -83,10 +80,11 @@ impl App {
         };
         let size = window.inner_size();
         let (ww, wh) = (size.width.max(1), size.height.max(1));
-        surface
-            .resize(NonZeroU32::new(ww).unwrap(), NonZeroU32::new(wh).unwrap())
-            .unwrap();
-        let mut buf = surface.buffer_mut().unwrap();
+        // A failed resize/present (e.g. while minimised) just skips this paint.
+        if surface.resize(NonZeroU32::new(ww).unwrap(), NonZeroU32::new(wh).unwrap()).is_err() {
+            return;
+        }
+        let Ok(mut buf) = surface.buffer_mut() else { return };
 
         let f = self.frame.lock().unwrap();
         if f.width == 0 || f.height == 0 {
@@ -104,11 +102,11 @@ impl App {
             }
         }
         drop(f);
-        buf.present().unwrap();
+        let _ = buf.present();
     }
 }
 
-impl ApplicationHandler<UserEvent> for App {
+impl ApplicationHandler<NetEvent> for App {
     fn resumed(&mut self, el: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -124,9 +122,9 @@ impl ApplicationHandler<UserEvent> for App {
         self.surface = Some(surface);
     }
 
-    fn user_event(&mut self, _el: &ActiveEventLoop, ev: UserEvent) {
+    fn user_event(&mut self, el: &ActiveEventLoop, ev: NetEvent) {
         match ev {
-            UserEvent::FrameReady => {
+            NetEvent::Frame => {
                 let gen = self.frame.lock().unwrap().generation;
                 if gen != self.last_gen {
                     self.last_gen = gen;
@@ -134,6 +132,11 @@ impl ApplicationHandler<UserEvent> for App {
                         w.request_redraw();
                     }
                 }
+            }
+            NetEvent::Closed(reason) => {
+                // Don't leave a frozen last frame on screen looking like a live display.
+                eprintln!("[net] disconnected: {reason}");
+                el.exit();
             }
         }
     }
@@ -265,14 +268,14 @@ fn main() {
 
     let frame: SharedFrame = Arc::new(Mutex::new(Frame::new()));
 
-    let event_loop = EventLoop::<UserEvent>::with_user_event()
+    let event_loop = EventLoop::<NetEvent>::with_user_event()
         .build()
         .expect("event loop");
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();
 
-    let wake: net::Wake = Arc::new(move || {
-        let _ = proxy.send_event(UserEvent::FrameReady);
+    let wake: net::Wake = Arc::new(move |ev| {
+        let _ = proxy.send_event(ev);
     });
 
     if use_h264 {

@@ -24,6 +24,7 @@ class ViewerActivity : Activity(), SurfaceHolder.Callback, SpacedeskClient.Liste
 
     private lateinit var surface: SurfaceView
     private var client: SpacedeskClient? = null
+    private var touchId = NO_TOUCH // pointer id of the finger driving the server's pointer
     private var mouseButtons = 0 // MotionEvent.BUTTON_* currently held
     private var scrollV = 0f // fractional wheel motion not yet sent
     private var scrollH = 0f
@@ -78,23 +79,41 @@ class ViewerActivity : Activity(), SurfaceHolder.Callback, SpacedeskClient.Liste
         )
     }
 
+    /**
+     * The server drives one pointer, so only the first finger down is forwarded until it lifts;
+     * extra fingers would otherwise press again or make the pointer jump between them.
+     */
     private fun onTouch(ev: MotionEvent) {
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                touchId = ev.getPointerId(0)
+                sendTouch(ev, 0, Protocol.TOUCH_DOWN)
+            }
+            MotionEvent.ACTION_MOVE -> {
+                val i = ev.findPointerIndex(touchId)
+                if (i >= 0) sendTouch(ev, i, 0)
+            }
+            MotionEvent.ACTION_POINTER_UP -> if (ev.getPointerId(ev.actionIndex) == touchId) {
+                sendTouch(ev, ev.actionIndex, Protocol.TOUCH_UP)
+                touchId = NO_TOUCH
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> if (touchId != NO_TOUCH) {
+                sendTouch(ev, ev.findPointerIndex(touchId).coerceAtLeast(0), Protocol.TOUCH_UP)
+                touchId = NO_TOUCH
+            }
+        }
+    }
+
+    private fun sendTouch(ev: MotionEvent, pointer: Int, flags: Int) {
         val c = client ?: return
         val (sw, sh) = c.serverSize()
         if (sw == 0 || sh == 0) return
         val vw = surface.width.coerceAtLeast(1)
         val vh = surface.height.coerceAtLeast(1)
-        val xs = (ev.x / vw * sw).toInt().coerceIn(0, sw - 1)
-        val ys = (ev.y / vh * sh).toInt().coerceIn(0, sh - 1)
+        val xs = (ev.getX(pointer) / vw * sw).toInt().coerceIn(0, sw - 1)
+        val ys = (ev.getY(pointer) / vh * sh).toInt().coerceIn(0, sh - 1)
         val ts = (SystemClock.uptimeMillis() and 0xFFFFFFFFL).toInt()
-        val flags = when (ev.actionMasked) {
-            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN ->
-                Protocol.TOUCH_ABSOLUTE or Protocol.TOUCH_DOWN
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP, MotionEvent.ACTION_CANCEL ->
-                Protocol.TOUCH_ABSOLUTE or Protocol.TOUCH_UP
-            else -> Protocol.TOUCH_ABSOLUTE
-        }
-        c.sendTouch(xs, ys, flags, ts)
+        c.sendTouch(xs, ys, Protocol.TOUCH_ABSOLUTE or flags, ts)
     }
 
     private fun isMouse(ev: MotionEvent): Boolean =
@@ -146,13 +165,16 @@ class ViewerActivity : Activity(), SurfaceHolder.Callback, SpacedeskClient.Liste
             KeyEvent.ACTION_DOWN -> 0
             KeyEvent.ACTION_UP -> Protocol.KEY_UP
             else -> return true
-        } or (if (Keys.isExtended(vk)) Protocol.KEY_EXTENDED else 0)
+        } or (if (Keys.isExtended(event.keyCode)) Protocol.KEY_EXTENDED else 0)
         c.sendKey(vk, flags)
         return true
     }
 
     override fun surfaceCreated(holder: SurfaceHolder) {
         client?.setSurface(holder)
+        // Connect once the first surface exists, so the server's opening keyframe can be shown.
+        // The session then outlives the surface (start() ignores later calls): while the app is
+        // in the background, video simply waits for a keyframe.
         client?.start()
     }
 
@@ -167,6 +189,12 @@ class ViewerActivity : Activity(), SurfaceHolder.Callback, SpacedeskClient.Liste
     override fun onConnected(serverWidth: Int, serverHeight: Int) {
         runOnUiThread {
             Toast.makeText(this, "connected · ${serverWidth}x$serverHeight", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    override fun onReconnecting(reason: String) {
+        runOnUiThread {
+            Toast.makeText(this, "connection lost ($reason) · reconnecting…", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -206,6 +234,7 @@ class ViewerActivity : Activity(), SurfaceHolder.Callback, SpacedeskClient.Liste
         const val EXTRA_H264 = "h264"
         const val EXTRA_FPS = "fps"
         const val EXTRA_QUALITY = "quality"
+        private const val NO_TOUCH = -1
 
         /** Android button bit -> Win32 down/up flags. */
         private val MOUSE_BUTTONS = listOf(

@@ -31,6 +31,8 @@ mod display;
 #[cfg(windows)]
 mod dxgi;
 #[cfg(windows)]
+mod flow;
+#[cfg(windows)]
 mod h264;
 #[cfg(windows)]
 mod inject;

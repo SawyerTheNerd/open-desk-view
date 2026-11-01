@@ -11,8 +11,20 @@ use proto::{Encoding, Framebuffer, Header, Identification, MsgType, HEADER_LEN};
 
 use crate::frame::SharedFrame;
 
-/// Called by the receive loop whenever a new frame is ready, so the UI can repaint.
-pub type Wake = Arc<dyn Fn() + Send + Sync>;
+/// What the receive loop tells the UI.
+pub enum NetEvent {
+    /// A new frame is ready to paint.
+    Frame,
+    /// The session ended (server closed it, or the link went silent).
+    Closed(String),
+}
+
+/// Called by the receive loop to wake the UI.
+pub type Wake = Arc<dyn Fn(NetEvent) + Send + Sync>;
+
+/// Servers ping at least every ~10 s (spacedesk) or 2-4 s (OpenDeskView's server), so this much
+/// silence means the connection is dead rather than idle.
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Hard cap on any single message payload from the (untrusted) server. A 4K JPEG band is a few MB;
 /// 64 MB is far more than legitimate traffic needs and bounds memory against a malicious length.
@@ -66,7 +78,7 @@ fn extract_utf16le_name(buf: &[u8]) -> String {
     while i + 1 < buf.len() {
         let lo = buf[i];
         let hi = buf[i + 1];
-        if hi == 0 && lo.is_ascii_graphic() || (hi == 0 && lo == b' ') {
+        if hi == 0 && (lo.is_ascii_graphic() || lo == b' ') {
             cur.push(lo as char);
         } else {
             if cur.len() > best.len() {
@@ -193,6 +205,7 @@ pub fn start(
 ) -> io::Result<Connection> {
     let stream = TcpStream::connect(addr)?;
     stream.set_nodelay(true).ok();
+    stream.set_read_timeout(Some(READ_TIMEOUT))?;
     let mut wstream = stream.try_clone()?;
 
     let (tx, rx) = channel::<Vec<u8>>();
@@ -212,9 +225,14 @@ pub fn start(
     // Reader thread.
     let tx_reader = tx.clone();
     std::thread::spawn(move || {
-        if let Err(e) = read_loop(stream, tx_reader, allow_h264, frame, wake) {
-            eprintln!("[net] receive loop ended: {e}");
-        }
+        let reason = match read_loop(stream, tx_reader, allow_h264, frame, &wake) {
+            Ok(()) => "the server closed the session".to_string(),
+            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+                "the server stopped responding".to_string()
+            }
+            Err(e) => e.to_string(),
+        };
+        wake(NetEvent::Closed(reason));
     });
 
     Ok(Connection { input: tx })
@@ -231,7 +249,7 @@ fn read_loop(
     tx: Sender<Vec<u8>>,
     allow_h264: bool,
     frame: SharedFrame,
-    wake: Wake,
+    wake: &Wake,
 ) -> io::Result<()> {
     let mut hbuf = [0u8; HEADER_LEN];
     let mut frag_counter: u32 = 0;
@@ -300,7 +318,7 @@ fn read_loop(
                         let mut f = frame.lock().unwrap();
                         f.generation = f.generation.wrapping_add(1);
                     }
-                    wake();
+                    wake(NetEvent::Frame);
                 }
             }
             MsgType::Ping => {

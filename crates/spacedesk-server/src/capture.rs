@@ -38,7 +38,8 @@ unsafe extern "system" fn enum_proc(
     let list = &mut *(lparam.0 as *mut Vec<Display>);
     let mut mi = MONITORINFOEXW::default();
     mi.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
-    if GetMonitorInfoW(hmon, &mut mi.monitorInfo as *mut _ as *mut MONITORINFO).as_bool() {
+    // The API writes the whole MONITORINFOEXW (cbSize says so), so point at all of it.
+    if GetMonitorInfoW(hmon, &mut mi as *mut MONITORINFOEXW as *mut MONITORINFO).as_bool() {
         let r = mi.monitorInfo.rcMonitor;
         let name = String::from_utf16_lossy(&mi.szDevice)
             .trim_end_matches('\0')
@@ -250,7 +251,7 @@ impl Capturer {
             bi.bmiHeader.biHeight = -h; // negative = top-down
             bi.bmiHeader.biPlanes = 1;
             bi.bmiHeader.biBitCount = 32;
-            bi.bmiHeader.biCompression = BI_RGB.0 as u32;
+            bi.bmiHeader.biCompression = BI_RGB.0;
 
             out.resize((w as usize) * (h as usize) * 4, 0);
             GetDIBits(
