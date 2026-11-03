@@ -9,6 +9,7 @@
 //!                                    #   resized to each viewer's screen
 //!   spacedesk-server --allow-input   # also let the viewer control mouse/keyboard/touch
 //!   spacedesk-server --bind 127.0.0.1  # restrict to this machine only (default 0.0.0.0 = LAN)
+//!   spacedesk-server --allow 192.168.1.200  # only these viewer IPs may connect (comma-separated)
 //!   spacedesk-server --no-h264       # never use OpenH264; always stream JPEG
 //!   spacedesk-server --capture-test  # write one frame to capture_test.jpg and exit
 //!
@@ -112,6 +113,17 @@ fn main() {
     let allow_input = has("--allow-input");
     let allow_h264 = !has("--no-h264");
     let bind = value("--bind").unwrap_or("0.0.0.0").to_string();
+    let allowed: Vec<std::net::IpAddr> = value("--allow")
+        .map(|list| {
+            list.split(',')
+                .map(|ip| {
+                    ip.trim().parse().unwrap_or_else(|_| {
+                        usage_error(&format!("--allow needs IP addresses separated by commas, not {ip:?}"))
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
     let target = if has("--virtual") {
         server::Target::Virtual
@@ -122,7 +134,7 @@ fn main() {
     };
 
     println!("[server] profile: {profile}");
-    if let Err(e) = server::run(settings, &bind, allow_input, target, allow_h264) {
+    if let Err(e) = server::run(settings, &bind, allow_input, target, allow_h264, allowed) {
         eprintln!("server error: {e}");
         std::process::exit(1);
     }

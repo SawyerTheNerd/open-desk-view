@@ -45,12 +45,14 @@ pub fn run(
     allow_input: bool,
     target: Target,
     allow_h264: bool,
+    allowed: Vec<IpAddr>,
 ) -> std::io::Result<()> {
     // Discovery listens on the same interface as the TCP server, so --bind 127.0.0.1
     // keeps discovery local too instead of reflecting replies to the whole LAN.
     let disco_bind = bind.to_string();
+    let disco_allowed = allowed.clone();
     std::thread::spawn(move || {
-        if let Err(e) = discovery_responder(&disco_bind) {
+        if let Err(e) = discovery_responder(&disco_bind, &disco_allowed) {
             eprintln!("[server] discovery responder stopped: {e}");
         }
     });
@@ -68,9 +70,12 @@ pub fn run(
         settings.idle_poll.as_millis()
     );
     eprintln!("[server] SECURITY: connections are UNAUTHENTICATED and UNENCRYPTED.");
-    if bind == "0.0.0.0" {
+    if !allowed.is_empty() {
+        let list: Vec<String> = allowed.iter().map(|ip| ip.to_string()).collect();
+        println!("[server]   Only these viewers may connect (--allow): {}", list.join(", "));
+    } else if bind == "0.0.0.0" {
         eprintln!("[server]   Anyone who can reach this PC on the LAN can VIEW this screen.");
-        eprintln!("[server]   Use --bind 127.0.0.1 to restrict to this machine only.");
+        eprintln!("[server]   Use --allow <viewer IP> to admit only your device, or --bind 127.0.0.1.");
     }
     if allow_input {
         eprintln!("[server]   INPUT INJECTION IS ENABLED — a connected viewer can control mouse/keyboard.");
@@ -95,6 +100,11 @@ pub fn run(
     for stream in listener.incoming() {
         match stream {
             Ok(s) => {
+                let peer = s.peer_addr().map(|a| a.ip());
+                if !peer.as_ref().is_ok_and(|ip| is_allowed(&allowed, ip)) {
+                    eprintln!("[server] refused {peer:?}: not in --allow");
+                    continue; // dropping the stream closes it before any frame is sent
+                }
                 std::thread::spawn(move || {
                     if let Err(e) = handle_client(s, settings, allow_input, target, allow_h264) {
                         eprintln!("[server] client ended: {e}");
@@ -496,7 +506,12 @@ fn inject_touch(h: &Header, target: Option<&str>) {
     }
 }
 
-fn discovery_responder(bind: &str) -> std::io::Result<()> {
+/// May a viewer at `ip` connect? An empty `allowed` list admits everyone.
+fn is_allowed(allowed: &[IpAddr], ip: &IpAddr) -> bool {
+    allowed.is_empty() || allowed.contains(&ip.to_canonical())
+}
+
+fn discovery_responder(bind: &str, allowed: &[IpAddr]) -> std::io::Result<()> {
     let sock = UdpSocket::bind((bind, PORT))?;
     let mut buf = [0u8; 2048];
 
@@ -522,7 +537,7 @@ fn discovery_responder(bind: &str) -> std::io::Result<()> {
         // This is a LAN discovery beacon: only local-network sources can be legitimate
         // clients. Ignoring everything else removes the internet reflection vector and
         // keeps a remote flood from draining the shared global budget below.
-        if !is_lan_source(&from.ip()) {
+        if !is_lan_source(&from.ip()) || !is_allowed(allowed, &from.ip()) {
             continue;
         }
         let now = Instant::now();
@@ -601,4 +616,21 @@ fn build_discovery_reply() -> Vec<u8> {
     reply[272..276].copy_from_slice(&4u32.to_le_bytes());
     reply[276..280].copy_from_slice(&8u32.to_le_bytes());
     reply
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allow_list_admits_only_listed_viewers() {
+        let chromebook: IpAddr = "192.168.1.200".parse().unwrap();
+        let stranger: IpAddr = "192.168.1.170".parse().unwrap();
+        assert!(is_allowed(&[], &stranger), "no list: anyone");
+        assert!(is_allowed(&[chromebook], &chromebook));
+        assert!(!is_allowed(&[chromebook], &stranger));
+        // An IPv4 viewer seen through a dual-stack socket still matches.
+        let mapped: IpAddr = "::ffff:192.168.1.200".parse().unwrap();
+        assert!(is_allowed(&[chromebook], &mapped));
+    }
 }

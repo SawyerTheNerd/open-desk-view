@@ -123,6 +123,7 @@ pnputil /add-driver C:\VirtualDisplayDriver\MttVDD.inf /install
 
 ```bash
 spacedesk-server --virtual --allow-input   # extended mode; the virtual monitor is resized to each viewer
+spacedesk-server --virtual --allow-input --allow 192.168.1.200   # only that device may connect
 spacedesk-server --list-displays           # show monitors and which one --virtual uses
 spacedesk-server                           # mirror the primary display instead
 ```
@@ -150,7 +151,9 @@ it is much smoother than JPEG (about 30+ fps vs 4 on a Chromebook).
 
 Stop spacedesk's own service first if it's installed — both use port 28252. Connections are
 **unauthenticated and unencrypted**: anyone on your LAN can view the streamed display, and with
-`--allow-input` control this PC. Use it only on a network you trust.
+`--allow-input` control this PC. Use it only on a network you trust, and pass `--allow <viewer IP>`
+(comma-separated for several) so other devices are refused; give the viewer a fixed address in your
+router so it keeps matching.
 
 ## OpenH264 (Windows H.264)
 
